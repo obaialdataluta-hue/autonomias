@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════════
+# SEGREDOS — NUNCA versionar (credenciais reais ficam só no
+# AWS Secrets Manager / variáveis de ambiente locais)
+# ═══════════════════════════════════════════════════════════════════
+.env
+.env.*
+!.env.example
+
+# Credenciais Google / OAuth / service accounts
+client_secret*.json
+credentials*.json
+token*.json
+*-gcp*.json
+obial-gcp.json
+service_account*.json
+*.pem
+*.key
+
+# ═══════════════════════════════════════════════════════════════════
+# Artefatos locais
+# ═══════════════════════════════════════════════════════════════════
+_legacy/
+geocode_cache.json
+*.xlsx
+
+# Build do AWS SAM
+.aws-sam/
+samconfig.toml
+
+# ═══════════════════════════════════════════════════════════════════
+# Python
+# ═══════════════════════════════════════════════════════════════════
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ═══════════════════════════════════════════════════════════════════
+# IDE / OS
+# ═══════════════════════════════════════════════════════════════════
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db

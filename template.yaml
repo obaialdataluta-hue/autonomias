@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ObAIAL Pipeline — coleta Google Alerts (Gmail), faz scraping, classifica com
+  Claude AI e grava na Google Sheet. Executa 1x/dia via EventBridge Scheduler.
+
+# ════════════════════════════════════════════════════════════════════
+# Parâmetros — ajuste no deploy (`sam deploy --guided`) sem tocar no código
+# ════════════════════════════════════════════════════════════════════
+Parameters:
+  SecretsRegion:
+    Type: String
+    Default: sa-east-1
+    Description: Região onde estão os segredos no AWS Secrets Manager.
+
+  GmailTokenSecretId:
+    Type: String
+    Default: gmail/obaial/token
+    Description: Nome/ID do segredo com o token OAuth do Gmail.
+
+  SheetsSaSecretId:
+    Type: String
+    Default: gcp/sheets_service_account
+    Description: Nome/ID do segredo com a service account do Google Sheets.
+
+  AnthropicSecretId:
+    Type: String
+    Default: anthropic/obaial/api_key
+    Description: Nome/ID do segredo com a chave da API Anthropic.
+
+  SpreadsheetId:
+    Type: String
+    Default: 1Bhhkozi3mduOqwz3VuYjeosLZ3GxrvGV0mAoHyYpwqw
+    Description: ID da Google Sheet de destino.
+
+  SheetName:
+    Type: String
+    Default: Obial
+    Description: Nome da aba principal de REGISTROS.
+
+  AnthropicModel:
+    Type: String
+    Default: claude-haiku-4-5-20251001
+    Description: Modelo Claude usado na classificação.
+
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 9 * * ? *)
+    Description: >
+      Quando rodar (UTC). Default: 09:00 UTC = 06:00 America/Sao_Paulo.
+
+# ════════════════════════════════════════════════════════════════════
+Globals:
+  Function:
+    Timeout: 600
+    MemorySize: 512
+    Runtime: python3.12
+
+Resources:
+  ObAIALPipelineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: obaial-pipeline-diario
+      CodeUri: src/
+      Handler: obAIAL_pipeline_merged.lambda_handler
+      Description: Pipeline diário ObAIAL (Gmail -> Claude -> Google Sheets).
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          OBAIAL_AWS_REGION: !Ref SecretsRegion
+          GMAIL_TOKEN_SECRET_ID: !Ref GmailTokenSecretId
+          SHEETS_SA_SECRET_ID: !Ref SheetsSaSecretId
+          ANTHROPIC_SECRET_ID: !Ref AnthropicSecretId
+          OBAIAL_SPREADSHEET_ID: !Ref SpreadsheetId
+          OBAIAL_SHEET_NAME: !Ref SheetName
+          ANTHROPIC_MODEL: !Ref AnthropicModel
+      # ── IAM: privilégio mínimo — apenas os 3 segredos do projeto ──
+      Policies:
+        - Statement:
+            - Sid: ReadProjectSecrets
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${GmailTokenSecretId}-*"
+                - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${SheetsSaSecretId}-*"
+                - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${AnthropicSecretId}-*"
+            - Sid: RotateGmailToken
+              Effect: Allow
+              # PutSecretValue só no token do Gmail (renovação do refresh token)
+              Action:
+                - secretsmanager:PutSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${GmailTokenSecretId}-*"
+      # ── Agendamento diário ──
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Name: obaial-pipeline-diario
+            Description: Dispara o pipeline ObAIAL uma vez por dia.
+
+  # Retenção de logs explícita (evita logs eternos e custo crescente)
+  ObAIALPipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ObAIALPipelineFunction}"
+      RetentionInDays: 90
+
+Outputs:
+  FunctionArn:
+    Description: ARN da função Lambda do pipeline.
+    Value: !GetAtt ObAIALPipelineFunction.Arn
+  FunctionName:
+    Description: Nome da função Lambda.
+    Value: !Ref ObAIALPipelineFunction
