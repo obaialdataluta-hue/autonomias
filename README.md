@@ -1,5 +1,103 @@
 # ObAIAL Pipeline
 
+![Arquitetura do projeto ObAIAL — coordenação UNESP, equipes nacionais, eixos temáticos e pipeline de Inteligência Artificial](docs/arquitetura-obaial.jpeg)
+
+> **Coordenação geral:** UNESP / Brasil — REDE DATALUTA (CNPq).
+> **Equipes nacionais:** Brasil · México · Colômbia · Argentina · Uruguai · Paraguai · Bolívia.
+> **Eixos temáticos:** Agrário · Urbano · Floresta · Água.
+
+## Contexto
+
+O **Observatório das Autonomias Indígenas na América Latina (ObAIAL)** monitora,
+de forma comparada e continental, dois movimentos socioterritoriais opostos:
+
+- **Autonomia** — autogovernos, territórios autônomos, autodeterminação;
+- **Estrangeirização** — capital transnacional, conflitos territoriais, aquisições.
+
+A partir desse monitoramento, o projeto produz **análise socioterritorial crítica
+e comparada** (padrões regionais, diferenças nacionais, tipologia de ações) e
+entrega seus resultados como Banco de Dados Regional, Atlas latino-americano,
+artigos e dossiês, relatórios e incidência em políticas públicas.
+
+O volume de notícias relevantes para sete países é grande demais para triagem e
+classificação manuais. Por isso o projeto usa um **pipeline de Inteligência
+Artificial** com cinco etapas — exatamente o fluxo do diagrama acima:
+
+| Etapa | O que faz | Quem executa |
+|-------|-----------|--------------|
+| **1. Coleta automatizada** | Recebe os Google Alerts por e-mail e extrai o texto completo de cada notícia | Sistema |
+| **2. Triagem** | Descarta ruído (ação puramente estatal, idioma fora de PT/ES, página inacessível) | Sistema |
+| **3. Classificação** | Estrutura cada notícia segundo a metodologia do projeto (ver RAG abaixo) | Sistema (Claude AI) |
+| **4. Banco comparável** | Normaliza tudo contra as listas controladas e grava na planilha do projeto | Sistema |
+| **5. Validação humana** | Pesquisador(a) revisa e confirma os registros já estruturados | **Humano** |
+
+## O que é o RAG e por que ele existe aqui
+
+**RAG** (*Retrieval-Augmented Generation*, "geração aumentada por recuperação") é
+a técnica que faz a IA classificar usando **o conhecimento do próprio projeto**,
+e não conhecimento genérico da internet. Em vez de perguntar ao modelo "o que
+você acha desta notícia?", o pipeline primeiro **recupera** a metodologia oficial
+do ObAIAL e a injeta no pedido enviado ao Claude.
+
+A metodologia é a **Árvore da Autonomia** (Alkmin, 2024): 13 estratégias de
+autonomia indígena, cada uma com suas ações-matriz, critérios de inclusão e
+exclusão, evidência mínima e exemplos. Tudo isso vive nas abas `LISTAS`,
+`MATRIZES` e `CODEBOOK` da Google Sheet — quem mantém a metodologia é a equipe,
+não o código.
+
+O RAG funciona em três momentos:
+
+1. **Pré-triagem determinística** (`score_strategies`) — antes de chamar a IA, o
+   sistema pontua as 13 estratégias por sobreposição de termos com o texto da
+   notícia e seleciona as candidatas mais prováveis. Isso é puramente
+   algorítmico, sem IA, e é reprodutível.
+2. **Montagem do contexto dinâmico** (`build_rag_context`) — o sistema monta um
+   "dossiê" enxuto contendo **apenas** as listas controladas e as matrizes
+   relevantes para as estratégias candidatas. Esse dossiê é anexado ao prompt do
+   Claude, junto com o texto da notícia e o esquema de saída em JSON.
+3. **Normalização pós-IA** (`validate_action`) — a resposta do Claude é validada
+   campo a campo contra as listas controladas. Valores fora do vocabulário do
+   projeto são corrigidos ou rejeitados, com a ressalva registrada em
+   `OBSERVACOES`. O banco nunca recebe categorias "inventadas".
+
+Se as abas de metodologia não estiverem disponíveis na planilha, o pipeline usa
+um RAG estático de fallback (`RAG_CONTEXT_FALLBACK`), garantindo que ele nunca
+roda sem referência metodológica.
+
+O efeito do RAG é triplo: a classificação fica **fiel à metodologia do projeto**,
+**rastreável** (toda decisão se ancora numa lista/matriz citável) e **fácil de
+evoluir** — mudar a metodologia é editar a planilha, não reprogramar o sistema.
+
+## O objetivo: preservar a análise humana
+
+Este sistema **não substitui o pesquisador — ele protege o trabalho dele.**
+
+A triagem e a classificação de notícias são tarefas repetitivas e exaustivas.
+Feitas manualmente, em escala continental, elas consomem justamente a energia
+analítica que deveria estar voltada à interpretação crítica. Pior: o cansaço
+introduz inconsistência — a 1ª notícia do dia é avaliada com um rigor, a 100ª
+com outro.
+
+A IA não cansa. Ela aplica **a centésima análise com o mesmo critério da
+primeira**: o mesmo conjunto de estratégias, os mesmos critérios de inclusão e
+exclusão, a mesma exigência de evidência. O resultado é um banco **comparável**
+de ponta a ponta — pré-condição para a análise socioterritorial comparada que é
+o produto final do projeto.
+
+Com isso, o(a) pesquisador(a) deixa de gastar tempo *garimpando e pré-formatando*
+notícias e passa a atuar onde o julgamento humano é insubstituível: a **validação
+humana** (etapa 5). Cada registro chega até essa etapa **já pré-selecionado,
+já estruturado e já ancorado na metodologia** — cabe ao humano confirmar,
+corrigir ou aprofundar, com o olhar crítico preservado para o que importa.
+
+> **Em resumo:** o sistema faz a centésima análise como a primeira, para que a
+> análise humana — escassa e valiosa — seja reservada às notícias que já passaram
+> por uma triagem rigorosa e consistente.
+
+---
+
+## Sobre este repositório
+
 Pipeline diário do **Observatório das Autonomias Indígenas na América Latina
 (ObAIAL)**: coleta Google Alerts via Gmail → scraping do texto completo →
 RAG dinâmico → classificação multi-ação com Claude AI → grava na Google Sheet.
@@ -46,6 +144,8 @@ Depois de rotacionar, guarde as **novas** credenciais apenas no Secrets Manager.
 │   ├── config/field_map.yml        # mapeamento de campos -> colunas da Sheet
 │   └── requirements.txt            # dependências (usado por `sam build`)
 ├── template.yaml                   # infraestrutura AWS SAM (Lambda + schedule + IAM)
+├── docs/
+│   └── arquitetura-obaial.jpeg     # diagrama exibido no topo deste README
 ├── .env.example                    # modelo de configuração local
 ├── .gitignore
 └── _legacy/                        # versões antigas (ignoradas pelo git)
