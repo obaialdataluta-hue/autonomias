@@ -49,6 +49,12 @@ Parameters:
     Description: >
       Quando rodar (UTC). Default: 09:00 UTC = 06:00 America/Sao_Paulo.
 
+  ApplicationLogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [TRACE, DEBUG, INFO, WARN, ERROR, FATAL]
+    Description: Nível mínimo dos logs da aplicação capturados no CloudWatch.
+
 # ════════════════════════════════════════════════════════════════════
 Globals:
   Function:
@@ -66,6 +72,11 @@ Resources:
       Description: Pipeline diário ObAIAL (Gmail -> Claude -> Google Sheets).
       Architectures:
         - x86_64
+      # ── Logs estruturados (JSON) no CloudWatch, com nível controlável ──
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: !Ref ApplicationLogLevel
+        SystemLogLevel: WARN
       Environment:
         Variables:
           OBAIAL_AWS_REGION: !Ref SecretsRegion

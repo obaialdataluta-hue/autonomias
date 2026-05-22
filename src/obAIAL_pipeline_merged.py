@@ -157,12 +157,19 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=_LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("obAIAL")
+# No AWS Lambda o runtime já configura o root logger ANTES de este módulo
+# carregar — então o logging.basicConfig() acima vira no-op e o logger
+# "obAIAL" herdaria o nível padrão do Lambda (WARNING), descartando todo
+# log.info(). Fixar o nível direto no logger garante que as mensagens INFO
+# apareçam tanto localmente quanto no CloudWatch.
+log.setLevel(_LOG_LEVEL)
 
 # ── AWS / Secrets Manager ─────────────────────────────────────────────
 # Toda credencial vem do AWS Secrets Manager — NUNCA versionar segredos.
