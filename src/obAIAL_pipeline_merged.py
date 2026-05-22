@@ -1142,9 +1142,28 @@ def _chamar_claude_com_retry(
             response = client.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=CLAUDE_MAX_TOKENS,
-                system=system_prompt,
+                # Prompt caching: o system prompt é fixo entre todas as
+                # notícias de um run. Marcá-lo com cache_control faz a API
+                # reaproveitá-lo (leitura a ~0,1x do custo) nas chamadas
+                # seguintes — desde que o prefixo atinja o mínimo cacheável.
+                system=[{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 messages=[{"role": "user", "content": user_prompt}],
             )
+            # métricas de prompt caching — permitem verificar se há cache hit
+            u = getattr(response, "usage", None)
+            if u is not None:
+                log.info(
+                    "    Claude tokens: entrada=%s cache_escrito=%s "
+                    "cache_lido=%s saída=%s",
+                    getattr(u, "input_tokens", "?"),
+                    getattr(u, "cache_creation_input_tokens", 0),
+                    getattr(u, "cache_read_input_tokens", 0),
+                    getattr(u, "output_tokens", "?"),
+                )
             # coleta todos os blocos de texto (Fabio — robusto)
             text = "".join(
                 b.text
