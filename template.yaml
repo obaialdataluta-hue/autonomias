@@ -52,9 +52,9 @@ Parameters:
 # ════════════════════════════════════════════════════════════════════
 Globals:
   Function:
-    Timeout: 600
+    Timeout: 900          # 15 min (máximo do Lambda) — runs com muitos alertas
     MemorySize: 512
-    Runtime: python3.12
+    Runtime: python3.13
 
 Resources:
   ObAIALPipelineFunction:

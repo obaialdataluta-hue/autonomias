@@ -149,8 +149,16 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 load_dotenv()
 
+# Garante saída em UTF-8: consoles Windows usam cp1252 e quebram com os
+# caracteres de moldura (║, ╚, ═) usados nas mensagens de log.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
@@ -179,7 +187,7 @@ FIELD_MAP_PATH = os.getenv(
 GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.readonly"]
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 GMAIL_QUERY   = "from:googlealerts-noreply@google.com newer_than:1d"
-MAX_MESSAGES  = 1
+MAX_MESSAGES  = 25
 USER_AGENT    = "ObAIALBot/1.0 (+research; contact: obaial)"
 
 # ── Claude API ────────────────────────────────────────────────────────
@@ -191,6 +199,11 @@ CLAUDE_MAX_TOKENS = 2200
 RETRY_ATTEMPTS    = 3
 RETRY_DELAY       = 5    # segundos entre tentativas
 INTER_CALL_DELAY  = 0.5  # intervalo entre chamadas sucessivas
+
+# ── Gravação incremental na Sheet ─────────────────────────────────────
+# Grava os registros em lotes DURANTE o processamento (não só no fim), para
+# que um timeout do Lambda não descarte o trabalho já realizado.
+SHEET_FLUSH_EVERY = int(os.getenv("OBAIAL_FLUSH_EVERY", "50"))
 
 # ── Localização e cache ──────────────────────────────────────────────
 DEFAULT_TZ = os.getenv("OBAIAL_TIMEZONE", "America/Sao_Paulo")
@@ -561,26 +574,34 @@ def parse_google_alerts_items(html: str) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
     seen  = set()
 
-    SKIP_TEXTS = {
-        "view all", "ver tudo", "see more", "ver mais",
-        "editar este alerta", "cancelar inscrição", "unsubscribe",
+    # Marcadores (minúsculos) de links de UI/rodapé do digest — não são notícias.
+    # Comparação por SUBSTRING, para cobrir variações ("Ver mais resultados" etc.).
+    SKIP_TEXT_MARKERS = (
+        "view all", "ver tudo", "ver todos", "see more", "ver mais",
+        "mais resultados", "more results",
+        "editar este alerta", "editar alerta", "edit this alert",
+        "cancelar inscrição", "cancelar inscricao", "unsubscribe",
+        "feedback", "flag as irrelevant", "sinalizar",
         "facebook", "twitter",
-    }
+    )
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
         text = a.get_text(" ", strip=True)
         if not href or not text:
             continue
-        if "google.com/alerts/feedback" in href or "google.com.br/alerts/feedback" in href:
-            continue
-        if text.lower() in SKIP_TEXTS:
+        if any(m in text.lower() for m in SKIP_TEXT_MARKERS):
             continue
 
         # desfaz redirect /url? (Pipeline 3)
         if "google.com/url?" in href:
             href = extract_real_url(href)
         if not href.startswith("http"):
+            continue
+
+        # descarta links internos do Google (gestão de alertas, busca, feeds,
+        # feedback, suporte) — nunca são artigos de notícia.
+        if re.search(r"(^|\.)google\.[a-z.]+$", urlparse(href).netloc.lower()):
             continue
 
         url_canon = canonicalize_url(href)
@@ -1727,9 +1748,10 @@ def main(
            e. Validação contra KB
            f. Geocoding aproximado
            g. Monta registro (COLUNAS Pipeline 3)
-        7. Grava RAW_TEXT (auditoria)
-        8. Grava REGISTROS na Sheet em lotes de 50
-        9. (Opcional) Salva Excel local
+           h. Gravação incremental: descarrega RAW_TEXT + REGISTROS na
+              Sheet a cada SHEET_FLUSH_EVERY registros (resiliente a timeout)
+        7. Descarga final do que restou nos buffers
+        8. (Opcional) Salva Excel local
     """
     geocode_cache = geocode_cache or default_geocode_cache_path()
 
@@ -1792,8 +1814,34 @@ def main(
         alertas = alertas[:limit]
         log.info(f"Limitado a {limit} item(s) (--limit).")
 
+    # Acumuladores completos (usados no resumo final e no Excel opcional).
     registros_to_write: List[dict]      = []
     raw_to_write:       List[List[Any]] = []
+    # Índices do que JÁ foi gravado na Sheet (gravação incremental).
+    reg_flushed = 0
+    raw_flushed = 0
+
+    def flush_to_sheets() -> None:
+        """
+        Grava na Sheet tudo que ainda não foi persistido (RAW_TEXT + REGISTROS).
+        Chamada periodicamente durante o loop: assim, se o Lambda estourar o
+        timeout, o trabalho já feito permanece salvo.
+        """
+        nonlocal sheets_svc, reg_flushed, raw_flushed
+        novos_raw = raw_to_write[raw_flushed:]
+        if novos_raw:
+            sheets_svc = sheets_append_values_com_retry(
+                sheets_svc, creds, "RAW_TEXT!A1", novos_raw
+            )
+            raw_flushed = len(raw_to_write)
+            log.info(f"  → RAW_TEXT: +{len(novos_raw)} linha(s) "
+                     f"({raw_flushed} no total).")
+        novos_reg = registros_to_write[reg_flushed:]
+        if novos_reg:
+            append_records_batch(sheets_svc, headers, field_map, novos_reg)
+            reg_flushed = len(registros_to_write)
+            log.info(f"  → REGISTROS: +{len(novos_reg)} linha(s) "
+                     f"({reg_flushed} no total).")
 
     # ── 9. Loop principal ─────────────────────────────────────────
     for i, alerta in enumerate(alertas, start=1):
@@ -1971,30 +2019,22 @@ def main(
         existing_urls.add(url_canon)
         existing_ids.add(id_reg)
 
+        # Gravação incremental: descarrega na Sheet a cada SHEET_FLUSH_EVERY
+        # registros novos, para um timeout não apagar o que já foi processado.
+        if not dry_run and len(registros_to_write) - reg_flushed >= SHEET_FLUSH_EVERY:
+            flush_to_sheets()
+
         if not dry_run and i < len(alertas):
             time.sleep(INTER_CALL_DELAY)
 
-    # ── 10. Persistir ─────────────────────────────────────────────
+    # ── 10. Persistir (descarga final do que restou) ──────────────
     if dry_run:
         log.info(
             f"DRY RUN: {len(raw_to_write)} RAW_TEXT e "
             f"{len(registros_to_write)} REGISTROS preparados; não gravando."
         )
     else:
-        if raw_to_write:
-            sheets_svc = sheets_append_values_com_retry(sheets_svc, creds, "RAW_TEXT!A1", raw_to_write)
-            log.info(f"RAW_TEXT: {len(raw_to_write)} linha(s) gravada(s).")
-
-        lote, escritos = [], 0
-        for rdict in registros_to_write:
-            lote.append(rdict)
-            if len(lote) >= 50:
-                append_records_batch(sheets_svc, headers, field_map, lote)
-                escritos += len(lote)
-                lote = []
-        if lote:
-            append_records_batch(sheets_svc, headers, field_map, lote)
-            escritos += len(lote)
+        flush_to_sheets()
 
     # ── 11. Excel local opcional ──────────────────────────────────
     if excel_output and registros_to_write:
@@ -2009,6 +2049,8 @@ def main(
     log.info(f"║  Registros gerados   : {len(registros_to_write)}")
     log.info(f"║  Classificados       : {classificados}")
     log.info(f"║  Descartados (ruído) : {descartados}")
+    if not dry_run:
+        log.info(f"║  Gravados na Sheet   : {reg_flushed} REGISTROS / {raw_flushed} RAW_TEXT")
     log.info("╚════════════════════════════════════════════")
 
 

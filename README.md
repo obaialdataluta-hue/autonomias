@@ -228,7 +228,7 @@ sam build && sam deploy
 
 O `template.yaml` provisiona:
 
-- a função Lambda (`python3.12`, timeout 600 s, 512 MB);
+- a função Lambda (`python3.13`, timeout 900 s, 512 MB);
 - o agendamento diário via EventBridge (`cron(0 9 * * ? *)` = 06:00 BRT);
 - política IAM de **privilégio mínimo** — acesso somente aos 3 segredos do projeto;
 - grupo de logs no CloudWatch com retenção de 90 dias.
