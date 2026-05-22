@@ -106,6 +106,96 @@ Roda **uma vez por dia** em uma função **AWS Lambda**, agendada por EventBridg
 
 ---
 
+## Como funciona — o fluxo do pipeline
+
+A cada execução diária o pipeline percorre uma esteira de 12 etapas, da caixa de
+entrada do Gmail até a linha gravada na planilha. O desenho abaixo é o mesmo do
+cabeçalho de [`obAIAL_pipeline_merged.py`](src/obAIAL_pipeline_merged.py):
+
+```text
+  Gmail (Google Alerts)
+       │   get_gmail_service — autentica via OAuth (AWS Secrets Manager)
+       ▼
+  parse_google_alerts_items()         extrai título + URL de cada digest
+       ▼
+  deduplicação dupla                  descarta o que já está na planilha
+       │   (URL canônica + hash sha256)
+       ▼
+  fetch_html() + extract_main_text()  baixa a página e isola o texto da notícia
+       ▼
+  detect_language_pt_es()             descarta idiomas fora de PT/ES
+       ▼
+  score_strategies() → build_rag_context()    monta o RAG dinâmico
+       ▼
+  _chamar_claude_com_retry()          classifica com o Claude (multi-ação)
+       ▼
+  validate_action()                   normaliza a saída contra as listas controladas
+       ▼
+  GeoCoder.geocode_municipio()        coordenadas aproximadas do município
+       ▼
+  build_registro()                    monta a linha no schema da planilha
+       ▼
+  append_records_batch()              grava na aba principal (lotes incrementais)
+       ▼
+  sheets_append_values(RAW_TEXT)      grava a linha de auditoria
+       ▼
+  salvar_excel()                      (opcional) cópia local .xlsx formatada
+```
+
+### Passo a passo
+
+**Coleta**
+
+1. **Gmail (Google Alerts)** — `get_gmail_service` autentica no Gmail com um
+   token OAuth guardado no AWS Secrets Manager e busca os e-mails de digest do
+   Google Alerts das últimas 24h.
+2. **`parse_google_alerts_items()`** — varre o HTML de cada digest e extrai
+   título, URL canônica e fonte de cada notícia, descartando os links de
+   interface do próprio e-mail.
+
+**Triagem**
+
+3. **Deduplicação dupla** — antes de gastar qualquer recurso, descarta notícias
+   já registradas, conferindo tanto a URL canônica quanto um hash `sha256`.
+4. **`fetch_html()` + `extract_main_text()`** — baixa a página da notícia e
+   isola o texto principal (prefere a tag `<article>`; se não houver, escolhe o
+   bloco de maior densidade textual).
+5. **`detect_language_pt_es()`** — heurística de idioma; notícias fora de
+   português e espanhol são descartadas automaticamente.
+
+**Classificação — o núcleo de IA**
+
+6. **`score_strategies()` → `build_rag_context()`** — *RAG dinâmico*: uma
+   pré-triagem determinística ranqueia as 13 estratégias da Árvore da Autonomia
+   por sobreposição de termos e monta um contexto enxuto só com as listas e
+   matrizes relevantes (ver *O que é o RAG* acima).
+7. **`_chamar_claude_com_retry()`** — envia texto + RAG + esquema ao Claude, que
+   classifica a notícia. Uma única notícia pode gerar **várias ações** — cada
+   ação autonômica vira uma linha. Há retry com espera exponencial em caso de
+   falha de API.
+8. **`validate_action()`** — normaliza a resposta do Claude contra as listas
+   controladas do projeto; valores fora do vocabulário são corrigidos ou
+   anotados em `OBSERVACOES`.
+9. **`GeoCoder.geocode_municipio()`** — coordenadas aproximadas do município
+   (Nominatim, com cache local e arredondamento a 0,1°).
+10. **`build_registro()`** — monta o dicionário final com as colunas do schema
+    da planilha.
+
+**Gravação — o banco comparável**
+
+11. **`append_records_batch()`** — grava os registros na aba principal `Obial`,
+    em lotes incrementais (resiliente a timeout — ver *Observações operacionais*).
+12. **`sheets_append_values(RAW_TEXT)`** — grava uma linha de auditoria na aba
+    `RAW_TEXT` (texto extraído, status, hashes) para rastreabilidade e
+    reprocessamento. Opcionalmente, `salvar_excel()` gera uma cópia local
+    `.xlsx` formatada.
+
+> Ao fim da esteira, cada notícia chega à planilha **já estruturada e
+> classificada** — pronta para a **validação humana** (etapa 5 do diagrama no
+> topo), em que o(a) pesquisador(a) confirma, corrige ou aprofunda o resultado.
+
+---
+
 ## ⚠️ Segurança — leia antes de qualquer commit
 
 Este repositório **NÃO contém segredos**. Toda credencial vem do
