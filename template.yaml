@@ -2,7 +2,9 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   ObAIAL Pipeline — coleta Google Alerts (Gmail), faz scraping, classifica com
-  Claude AI e grava na Google Sheet. Executa 1x/dia via EventBridge Scheduler.
+  Claude AI e grava na Google Sheet. Processa o mês anterior em chunks (sessões
+  de ~8 min) iniciados 1x/mês e, ao concluir, envia um digest de validação por
+  e-mail (Gmail API). Feedback humano na Sheet vira few-shot na rodada seguinte.
 
 # ════════════════════════════════════════════════════════════════════
 # Parâmetros — ajuste no deploy (`sam deploy --guided`) sem tocar no código
@@ -43,11 +45,18 @@ Parameters:
     Default: claude-haiku-4-5-20251001
     Description: Modelo Claude usado na classificação.
 
-  ScheduleExpression:
+  BackfillInitSchedule:
     Type: String
-    Default: cron(0 9 * * ? *)
+    Default: cron(0 6 1 * ? *)
     Description: >
-      Quando rodar (UTC). Default: 09:00 UTC = 06:00 America/Sao_Paulo.
+      Quando INICIAR o backfill do mês anterior (UTC). Default: dia 1, 06:00 UTC.
+
+  BackfillChunkSchedule:
+    Type: String
+    Default: rate(12 minutes)
+    Description: >
+      Frequência das sessões (chunks) que processam o mês em pedaços de ~8 min.
+      Ticks ociosos (sem job em andamento) saem barato (no-op).
 
   ApplicationLogLevel:
     Type: String
@@ -58,8 +67,9 @@ Parameters:
 # ════════════════════════════════════════════════════════════════════
 Globals:
   Function:
-    Timeout: 900          # 15 min (máximo do Lambda) — runs com muitos alertas
-    MemorySize: 512
+    Timeout: 900          # 15 min = teto do Lambda. O mês é coberto em vários
+                          # chunks; este teto segue valendo POR sessão.
+    MemorySize: 1024      # mais memória = mais CPU → scraping/parse mais rápidos
     Runtime: python3.13
 
 Resources:
@@ -86,6 +96,8 @@ Resources:
           OBAIAL_SPREADSHEET_ID: !Ref SpreadsheetId
           OBAIAL_SHEET_NAME: !Ref SheetName
           ANTHROPIC_MODEL: !Ref AnthropicModel
+          # Gravação incremental em lotes pequenos (resiliente a timeout).
+          OBAIAL_FLUSH_EVERY: "5"
       # ── IAM: privilégio mínimo — apenas os 3 segredos do projeto ──
       Policies:
         - Statement:
@@ -104,14 +116,24 @@ Resources:
                 - secretsmanager:PutSecretValue
               Resource:
                 - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${GmailTokenSecretId}-*"
-      # ── Agendamento diário ──
+      # ── Agendamentos do backfill mensal em chunks ──
       Events:
-        DailySchedule:
+        # Dia 1 do mês: inicia o job do mês anterior (grava cursor na aba ESTADO).
+        BackfillInit:
           Type: Schedule
           Properties:
-            Schedule: !Ref ScheduleExpression
-            Name: obaial-pipeline-diario
-            Description: Dispara o pipeline ObAIAL uma vez por dia.
+            Schedule: !Ref BackfillInitSchedule
+            Name: obaial-backfill-init
+            Description: Inicia o backfill ObAIAL do mês anterior.
+            Input: '{"mode": "backfill_init"}'
+        # A cada ~12 min: processa um chunk; ao concluir o mês, envia o digest.
+        BackfillChunk:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref BackfillChunkSchedule
+            Name: obaial-backfill-chunk
+            Description: Processa um chunk do backfill ObAIAL (~8 min úteis).
+            Input: '{"mode": "backfill_chunk"}'
 
   # Retenção de logs explícita (evita logs eternos e custo crescente)
   ObAIALPipelineLogGroup:

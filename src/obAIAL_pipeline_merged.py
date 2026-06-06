@@ -100,6 +100,7 @@ Dependências:
 
 Projeto: Observatório das Autonomias Indígenas na América Latina (ObAIAL)
 Pesquisador: Dr. Fábio M. Alkmin | Supervisor: Prof. Dr. Bernardo Mançano Fernandes
+Técnico: Ms. Frederico Nunes
 Framework: Árvore da Autonomia (Alkmin, 2024) + Metodologia REDE DATALUTA
 """
 
@@ -107,15 +108,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import datetime as dt
 import hashlib
+import html as html_lib
 import json
 import logging
 import math
 import os
+import random
 import re
 import sys
 import time
+from email.mime.text import MIMEText
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import anthropic, httpx
@@ -191,10 +196,15 @@ FIELD_MAP_PATH = os.getenv(
 )
 
 # ── Gmail ─────────────────────────────────────────────────────────────
-GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.readonly"]
+# gmail.modify cobre leitura E envio (users.messages.send) — necessário para o
+# digest mensal por e-mail. O token OAuth no Secrets Manager PRECISA ter sido
+# autorizado com este escopo; um token antigo só-leitura não envia e-mail.
+GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.modify"]
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-GMAIL_QUERY   = "from:googlealerts-noreply@google.com newer_than:1d"
-MAX_MESSAGES  = 25
+GMAIL_SENDER  = "from:googlealerts-noreply@google.com"
+GMAIL_QUERY   = f"{GMAIL_SENDER} newer_than:1d"
+# Limite por página da API Gmail; com paginação cobrimos dias com muitos digests.
+MAX_MESSAGES  = 100
 USER_AGENT    = "ObAIALBot/1.0 (+research; contact: obaial)"
 
 # ── Claude API ────────────────────────────────────────────────────────
@@ -202,15 +212,39 @@ USER_AGENT    = "ObAIALBot/1.0 (+research; contact: obaial)"
 #   1) variável de ambiente ANTHROPIC_API_KEY (uso local/dev)
 #   2) AWS Secrets Manager em ANTHROPIC_SECRET_ID (uso em produção/Lambda)
 CLAUDE_MODEL      = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-CLAUDE_MAX_TOKENS = 2200
+# 2200 era baixo: notícias com várias ações/evidências estouravam o limite e o
+# JSON vinha truncado (output_tokens == max_tokens → "JSON inválido" e perda do
+# item após 3 retries). 8000 cobre as saídas multi-ação com folga.
+CLAUDE_MAX_TOKENS = int(os.getenv("OBAIAL_MAX_TOKENS", "8000"))
 RETRY_ATTEMPTS    = 3
 RETRY_DELAY       = 5    # segundos entre tentativas
 INTER_CALL_DELAY  = 0.5  # intervalo entre chamadas sucessivas
 
 # ── Gravação incremental na Sheet ─────────────────────────────────────
 # Grava os registros em lotes DURANTE o processamento (não só no fim), para
-# que um timeout do Lambda não descarte o trabalho já realizado.
-SHEET_FLUSH_EVERY = int(os.getenv("OBAIAL_FLUSH_EVERY", "50"))
+# que um timeout do Lambda não descarte o trabalho já realizado. Default baixo
+# (5): no modo chunked cada sessão é curta, então gravar cedo e em lotes
+# pequenos garante que o progresso fique salvo mesmo se o tempo acabar.
+SHEET_FLUSH_EVERY = int(os.getenv("OBAIAL_FLUSH_EVERY", "5"))
+
+# ── Backfill mensal em chunks (máquina de estados na aba ESTADO) ───────
+# O processamento de um mês inteiro não cabe nos 900s do Lambda, então é
+# quebrado em várias sessões ("chunks"). O estado fica numa aba da Sheet.
+ESTADO_TAB         = os.getenv("OBAIAL_ESTADO_TAB", "ESTADO")
+DESTINATARIOS_TAB  = os.getenv("OBAIAL_DESTINATARIOS_TAB", "DESTINATARIOS")
+# Reserva de tempo (ms) que cada chunk deixa livre para fazer flush final e
+# salvar o cursor antes de o Lambda ser morto por timeout.
+CHUNK_RESERVE_MS   = int(os.getenv("OBAIAL_CHUNK_RESERVE_MS", "120000"))
+# Orçamento padrão (ms) de um chunk quando não há contexto Lambda (CLI/local).
+CHUNK_BUDGET_MS    = int(os.getenv("OBAIAL_CHUNK_BUDGET_MS", "480000"))  # 8 min
+
+# ── Digest mensal por e-mail + few-shot de feedback ───────────────────
+DIGEST_RESUMO_LEN  = int(os.getenv("OBAIAL_DIGEST_RESUMO_LEN", "240"))
+DIGEST_N_POSITIVOS = int(os.getenv("OBAIAL_DIGEST_N_POSITIVOS", "5"))
+DIGEST_N_NEGATIVOS = int(os.getenv("OBAIAL_DIGEST_N_NEGATIVOS", "3"))
+FEWSHOT_MAX        = int(os.getenv("OBAIAL_FEWSHOT_MAX", "12"))
+# Semente fixa para a amostragem aleatória dos negativos (reprodutível).
+DIGEST_SEED        = int(os.getenv("OBAIAL_DIGEST_SEED", "1337"))
 
 # ── Localização e cache ──────────────────────────────────────────────
 DEFAULT_TZ = os.getenv("OBAIAL_TIMEZONE", "America/Sao_Paulo")
@@ -242,6 +276,9 @@ COLUNAS = [
     "NIVEL_ESCALA_PUBLICAVEL", "RISCO_PUBLICACAO",
     "GEO_PRECISA", "COORD_LAT", "COORD_LON",
     "NOTA_ANALITICA", "OBSERVACOES", "CODIFICADOR", "DATA_VALIDACAO",
+    # Feedback humano (preenchido manualmente na Sheet; lido como few-shot na
+    # rodada seguinte). VALIDACAO_HUMANA = "Sim"/"Não"; COMENTARIO_HUMANO livre.
+    "VALIDACAO_HUMANA", "COMENTARIO_HUMANO",
 ]
 
 # ── RAW_TEXT headers (Fabio) ─────────────────────────────────────────
@@ -638,17 +675,49 @@ def parse_google_alerts_items(html: str) -> List[Dict[str, str]]:
     return items
 
 
-def coletar_alertas_gmail(gmail_svc, max_messages: int = MAX_MESSAGES) -> List[Dict]:
-    res  = gmail_svc.users().messages().list(
-        userId="me", q=GMAIL_QUERY, maxResults=max_messages
-    ).execute()
-    msgs = res.get("messages", [])
-    log.info(f"Gmail: {len(msgs)} mensagem(ns) encontrada(s).")
+def gmail_query_dia(d: dt.date) -> str:
+    """Query do Gmail para os digests de UM dia (after:D before:D+1, exclusivo)."""
+    proximo = d + dt.timedelta(days=1)
+    return (
+        f"{GMAIL_SENDER} "
+        f"after:{d.strftime('%Y/%m/%d')} before:{proximo.strftime('%Y/%m/%d')}"
+    )
 
+
+def _gmail_list_all_ids(gmail_svc, query: str, max_per_page: int) -> List[str]:
+    """Lista TODOS os IDs de mensagem da query, paginando com pageToken."""
+    ids: List[str] = []
+    page_token = None
+    while True:
+        res = gmail_svc.users().messages().list(
+            userId="me", q=query, maxResults=max_per_page, pageToken=page_token
+        ).execute()
+        ids.extend(m["id"] for m in res.get("messages", []))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return ids
+
+
+def coletar_alertas_gmail(
+    gmail_svc,
+    query: str = GMAIL_QUERY,
+    max_messages: int = MAX_MESSAGES,
+    date_iso: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Coleta itens de Google Alerts. `query` permite janelas de data arbitrárias
+    (ver gmail_query_dia). Pagina para não perder mensagens em dias com muitos
+    digests. `date_iso` rotula a data dos itens (default: hoje).
+    """
+    ids = _gmail_list_all_ids(gmail_svc, query, max_messages)
+    log.info(f"Gmail: {len(ids)} mensagem(ns) encontrada(s) [{query}].")
+
+    label_date = date_iso or dt.date.today().isoformat()
     alertas = []
-    for m in msgs:
+    for mid in ids:
         msg  = gmail_svc.users().messages().get(
-            userId="me", id=m["id"], format="full"
+            userId="me", id=mid, format="full"
         ).execute()
         html = gmail_get_html_body(msg)
         if not html:
@@ -658,12 +727,31 @@ def coletar_alertas_gmail(gmail_svc, max_messages: int = MAX_MESSAGES) -> List[D
                 "title":  it["title"],
                 "url":    it["url"],
                 "body":   "",
-                "date":   dt.date.today().isoformat(),
+                "date":   label_date,
                 "source": it["source"],
             })
 
     log.info(f"Gmail: {len(alertas)} item(ns) extraído(s) dos digests.")
     return alertas
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# GMAIL – ENVIO (digest mensal)
+# ═══════════════════════════════════════════════════════════════════════
+
+def enviar_email_gmail(
+    gmail_svc, destinatarios: List[str], assunto: str, html_body: str
+) -> None:
+    """Envia um e-mail HTML via Gmail API (users.messages.send)."""
+    if not destinatarios:
+        log.warning("enviar_email_gmail: sem destinatários — e-mail não enviado.")
+        return
+    msg = MIMEText(html_body, "html", "utf-8")
+    msg["To"]      = ", ".join(destinatarios)
+    msg["Subject"] = assunto
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    gmail_svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+    log.info(f"Digest enviado para {len(destinatarios)} destinatário(s).")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -694,11 +782,27 @@ def fetch_html(url: str, timeout: int = 20) -> FetchResult:
         return FetchResult(ok=False, status_code=0, final_url=url, html="", error=str(e))
 
 
+def _safe_soup(html: str) -> Optional[BeautifulSoup]:
+    """
+    BeautifulSoup tolerante a HTML malformado. O parser padrão (html.parser) da
+    stdlib pode lançar (ex.: ValueError em charref inválido como '&#39bons') e
+    derrubar a sessão inteira — inaceitável num backfill longo. Aqui qualquer
+    falha de parse vira None (a página é ignorada, o chunk continua).
+    """
+    if not html:
+        return None
+    try:
+        return BeautifulSoup(html, "html.parser")
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"Falha ao parsear HTML ({e}); extração ignorada nesta página.")
+        return None
+
+
 def extract_main_text(html: str) -> str:
     """Extrai texto principal do HTML. Prefere <article>, fallback por densidade."""
-    if not html:
+    soup = _safe_soup(html)
+    if soup is None:
         return ""
-    soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script","style","noscript","header","footer","nav","aside","form"]):
         try:
             tag.decompose()
@@ -722,9 +826,9 @@ def extract_main_text(html: str) -> str:
 
 
 def extract_title_from_html(html: str) -> str:
-    if not html:
+    soup = _safe_soup(html)
+    if soup is None:
         return ""
-    soup = BeautifulSoup(html, "html.parser")
     if soup.title and soup.title.get_text(strip=True):
         return soup.title.get_text(strip=True)
     h1 = soup.find("h1")
@@ -733,9 +837,9 @@ def extract_title_from_html(html: str) -> str:
 
 def extract_published_date_from_html(html: str) -> Optional[dt.date]:
     """Extrai data de publicação via meta tags, JSON-LD e <time>."""
-    if not html:
+    soup = _safe_soup(html)
+    if soup is None:
         return None
-    soup = BeautifulSoup(html, "html.parser")
     for attr, key in [
         ("property", "article:published_time"),
         ("property", "og:published_time"),
@@ -1057,6 +1161,7 @@ def build_user_prompt(
     lang: str,
     estrategias_candidatas: List[str],
     rag_context: str,
+    fewshot_block: str = "",
 ) -> str:
     schema = """
 Retorne JSON estrito (sem markdown) com o seguinte formato:
@@ -1109,7 +1214,7 @@ Regras obrigatórias:
 - Ação meramente estatal → e_autonomica=false, explique em observacoes.
 - Idioma diferente de PT/ES → descartar_noticia=true.
 """
-    return "\n".join([
+    partes = [
         f"TÍTULO: {title}",
         f"FONTE: {source}",
         f"URL: {url}",
@@ -1119,11 +1224,16 @@ Regras obrigatórias:
         "",
         rag_context,
         "",
+    ]
+    if fewshot_block:
+        partes += [fewshot_block, ""]
+    partes += [
         schema,
         "",
         "### TEXTO COMPLETO (extraído da página)",
         text,
-    ])
+    ]
+    return "\n".join(partes)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1510,9 +1620,14 @@ def append_records_batch(
     filled = [headers[i] for i, v in enumerate(rows[0]) if v]
     log.info(f"  → Colunas preenchidas na linha 1: {filled[:8]}{'...' if len(filled) > 8 else ''}")
 
+    # IMPORTANTE: usar a âncora "A1" (e NÃO "A:ZZ"). Com o range de colunas
+    # inteiras, a detecção de tabela do Sheets pode ancorar num bloco de dados
+    # perdido em colunas distantes e gravar as linhas DESLOCADAS (ex.: a partir
+    # da coluna BW). Ancorar em A1 força o append a alinhar na coluna A, igual ao
+    # append do RAW_TEXT (sheets_append_values).
     result = sheets_svc.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_NAME}!A:ZZ",
+        range=f"{SHEET_NAME}!A1",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
@@ -1623,6 +1738,8 @@ def build_registro(
             "OBSERVACOES":               observacoes,
             "CODIFICADOR":               CLAUDE_MODEL,
             "DATA_VALIDACAO":            "",
+            "VALIDACAO_HUMANA":          "",
+            "COMENTARIO_HUMANO":         "",
         }
     else:
         a = action or {}
@@ -1673,6 +1790,8 @@ def build_registro(
             "OBSERVACOES":               observacoes,
             "CODIFICADOR":               CLAUDE_MODEL,
             "DATA_VALIDACAO":            "",
+            "VALIDACAO_HUMANA":          "",
+            "COMENTARIO_HUMANO":         "",
         }
 
     return _aplicar_validacoes_cruzadas(registro)
@@ -1753,166 +1872,202 @@ def default_geocode_cache_path() -> str:
     return "/tmp/geocode_cache.json" if is_running_in_lambda() else "geocode_cache.json"
 
 
-def main(
-    dry_run: bool = False,
-    excel_output: Optional[str] = None,
-    limit: Optional[int] = None,
-    geocode_cache: Optional[str] = None,
-) -> None:
+# ═══════════════════════════════════════════════════════════════════════
+# FEW-SHOT A PARTIR DO FEEDBACK HUMANO (rodada anterior)
+# ═══════════════════════════════════════════════════════════════════════
+
+def carregar_fewshot(sheets_svc) -> str:
     """
-    Pipeline completo:
-        1. Inicializa serviços (AWS → Gmail + Sheets)
-        2. Carrega KnowledgeBase (LISTAS/MATRIZES/CODEBOOK)
-        3. Garante aba RAW_TEXT
-        4. Coleta alertas do Gmail
-        5. Deduplicação dupla (URL + sha256)
-        6. Para cada novo alerta:
-           a. Scraping (texto completo)
-           b. Detecção de idioma
-           c. RAG dinâmico (ou fallback estático)
-           d. Classificação multi-ação com Claude (retry)
-           e. Validação contra KB
-           f. Geocoding aproximado
-           g. Monta registro (COLUNAS Pipeline 3)
-           h. Gravação incremental: descarrega RAW_TEXT + REGISTROS na
-              Sheet a cada SHEET_FLUSH_EVERY registros (resiliente a timeout)
-        7. Descarga final do que restou nos buffers
-        8. (Opcional) Salva Excel local
+    Monta um bloco de few-shot a partir do feedback humano já registrado na Sheet.
+    Lê a aba principal, seleciona registros com VALIDACAO_HUMANA = Sim/Não, pega
+    os mais recentes (por DATA_VALIDACAO/DATA_INICIO) até FEWSHOT_MAX e formata
+    como exemplos para guiar a classificação do Claude na rodada atual.
+    Silencioso (retorna "") se a coluna não existir ou não houver feedback.
     """
-    geocode_cache = geocode_cache or default_geocode_cache_path()
+    try:
+        regs = sheets_get_values(sheets_svc, f"{SHEET_NAME}!A1:ZZ")
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"carregar_fewshot: falha ao ler a Sheet: {e}")
+        return ""
+    if not regs or len(regs) < 2:
+        return ""
+    headers = regs[0]
+    idx = {h: i for i, h in enumerate(headers)}
+    if "VALIDACAO_HUMANA" not in idx:
+        return ""
 
-    log.info("╔══ ObAIAL Pipeline v2 (merged) ════════════════════════")
-    log.info(f"║  Modelo Claude  : {CLAUDE_MODEL}")
-    log.info(f"║  Spreadsheet ID : {SPREADSHEET_ID}")
-    log.info(f"║  Aba principal  : {SHEET_NAME}")
-    log.info(f"║  Dry-run        : {dry_run}")
-    log.info(f"║  Excel local    : {excel_output or '(desativado)'}")
-    log.info(f"║  Geocode cache  : {geocode_cache}")
-    log.info("╚═══════════════════════════════════════════════════════")
+    def cell(r: List[Any], name: str) -> str:
+        i = idx.get(name, -1)
+        return str(r[i]).strip() if 0 <= i < len(r) else ""
 
-    # ── 1. Serviços ───────────────────────────────────────────────
-    gmail_svc  = get_gmail_service()
-    sheets_svc, creds = get_sheets_service()
-    field_map  = load_field_map()
-    today_iso  = dt.date.today().isoformat()
-
-    # ── 2. Garantir aba RAW_TEXT ──────────────────────────────────
-    sheets_ensure_tab(sheets_svc, "RAW_TEXT", RAW_TEXT_HEADERS)
-
-    # ── 3. Headers + dedup ────────────────────────────────────────
-    headers       = get_sheet_headers(sheets_svc)
-    existing_urls = load_existing_urls(sheets_svc)
-    existing_ids  = load_existing_ids(sheets_svc, headers)
-    log.info(f"Sheet: {len(existing_urls)} URL(s) já registrada(s).")
-
-    # ── 4. CODIGO_NOTICIA allocator ───────────────────────────────
-    allocator = CodigoAllocator(load_existing_codes(sheets_svc))
-
-    # ── 5. KnowledgeBase (RAG dinâmico) ───────────────────────────
-    kb = KnowledgeBase()
-    kb.load_from_sheets(sheets_svc)
-    if kb.is_empty():
-        log.warning(
-            "⚠  LISTAS/MATRIZES/CODEBOOK não encontrados na Sheet. "
-            "Usando RAG_CONTEXT_FALLBACK (string estática). "
-            "Adicione as abas para RAG dinâmico completo."
-        )
-
-    # ── 6. Geocoder ───────────────────────────────────────────────
-    geocoder = GeoCoder(cache_path=geocode_cache)
-
-    # ── 7. Claude client ──────────────────────────────────────────
-    claude_client = None
-    if not dry_run:
-        api_key = get_anthropic_api_key()
-        if not api_key:
-            raise ValueError(
-                "Chave da API Anthropic indisponível. Defina ANTHROPIC_API_KEY "
-                f"ou o segredo '{ANTHROPIC_SECRET_ID}' no AWS Secrets Manager."
-            )
-        claude_client = anthropic.Anthropic(
-            api_key=api_key, http_client=httpx.Client(timeout=60.0)
-        )
-
-    # ── 8. Coleta alertas ─────────────────────────────────────────
-    alertas = coletar_alertas_gmail(gmail_svc)
-    if limit:
-        alertas = alertas[:limit]
-        log.info(f"Limitado a {limit} item(s) (--limit).")
-
-    # Acumuladores completos (usados no resumo final e no Excel opcional).
-    registros_to_write: List[dict]      = []
-    raw_to_write:       List[List[Any]] = []
-    # Índices do que JÁ foi gravado na Sheet (gravação incremental).
-    reg_flushed = 0
-    raw_flushed = 0
-
-    def flush_to_sheets() -> None:
-        """
-        Grava na Sheet tudo que ainda não foi persistido (RAW_TEXT + REGISTROS).
-        Chamada periodicamente durante o loop: assim, se o Lambda estourar o
-        timeout, o trabalho já feito permanece salvo.
-        """
-        nonlocal sheets_svc, reg_flushed, raw_flushed
-        novos_raw = raw_to_write[raw_flushed:]
-        if novos_raw:
-            sheets_svc = sheets_append_values_com_retry(
-                sheets_svc, creds, "RAW_TEXT!A1", novos_raw
-            )
-            raw_flushed = len(raw_to_write)
-            log.info(f"  → RAW_TEXT: +{len(novos_raw)} linha(s) "
-                     f"({raw_flushed} no total).")
-        novos_reg = registros_to_write[reg_flushed:]
-        if novos_reg:
-            append_records_batch(sheets_svc, headers, field_map, novos_reg)
-            reg_flushed = len(registros_to_write)
-            log.info(f"  → REGISTROS: +{len(novos_reg)} linha(s) "
-                     f"({reg_flushed} no total).")
-
-    # ── 9. Loop principal ─────────────────────────────────────────
-    for i, alerta in enumerate(alertas, start=1):
-        url_canon = alerta["url"]
-        id_reg    = sha256_hex(url_canon)
-
-        # deduplicação dupla (URL + sha256)
-        if url_canon in existing_urls or id_reg in existing_ids:
-            log.info(f"  [{i}/{len(alertas)}] SKIP (já existente): {url_canon[:80]}")
+    exemplos = []
+    for r in regs[1:]:
+        veredito = cell(r, "VALIDACAO_HUMANA").lower()
+        if veredito not in ("sim", "não", "nao"):
             continue
+        exemplos.append({
+            "data":       cell(r, "DATA_VALIDACAO") or cell(r, "DATA_INICIO"),
+            "titulo":     cell(r, "TITULO_CURTO"),
+            "estrategia": cell(r, "ESTRATEGIA_ARVORE_PRIMARIA"),
+            "correto":    "Sim" if veredito == "sim" else "Não",
+            "comentario": cell(r, "COMENTARIO_HUMANO"),
+        })
+    if not exemplos:
+        return ""
 
+    exemplos.sort(key=lambda e: e["data"], reverse=True)
+    exemplos = exemplos[:FEWSHOT_MAX]
+    linhas = [
+        "## EXEMPLOS DE FEEDBACK HUMANO (rodada anterior) — aprenda com eles:",
+        "Cada item mostra uma classificação passada e se um pesquisador a "
+        "considerou correta. 'Não' = falso positivo a evitar; 'Sim' = bom acerto. "
+        "Use como referência de calibração, sem copiar literalmente.",
+    ]
+    for e in exemplos:
+        linha = f"- [{e['correto']}] {e['titulo']} | Estratégia: {e['estrategia'] or '—'}"
+        if e["comentario"]:
+            linha += f" | Comentário do revisor: {e['comentario']}"
+        linhas.append(linha)
+    log.info(f"Few-shot: {len(exemplos)} exemplo(s) de feedback humano carregado(s).")
+    return "\n".join(linhas)
+
+
+class PipelineCtx:
+    """
+    Estado compartilhado de uma sessão de processamento: serviços (Gmail/Sheets/
+    Claude), KnowledgeBase, dedup, allocator de código, geocoder, few-shot e os
+    buffers de gravação incremental. Reutilizado pelo run legado `main()` e pelo
+    backfill mensal em chunks (`backfill_chunk`), garantindo lógica única de
+    scraping → classificação → validação → gravação.
+    """
+
+    def __init__(
+        self,
+        dry_run: bool = False,
+        geocode_cache: Optional[str] = None,
+        load_fewshot: bool = True,
+    ) -> None:
+        self.dry_run = dry_run
+        self.gmail_svc = get_gmail_service()
+        self.sheets_svc, self.creds = get_sheets_service()
+        self.field_map = load_field_map()
+        self.today_iso = dt.date.today().isoformat()
+
+        sheets_ensure_tab(self.sheets_svc, "RAW_TEXT", RAW_TEXT_HEADERS)
+        self.headers = get_sheet_headers(self.sheets_svc)
+        self.existing_urls = load_existing_urls(self.sheets_svc)
+        self.existing_ids = load_existing_ids(self.sheets_svc, self.headers)
+        log.info(f"Sheet: {len(self.existing_urls)} URL(s) já registrada(s).")
+
+        self.allocator = CodigoAllocator(load_existing_codes(self.sheets_svc))
+
+        self.kb = KnowledgeBase()
+        self.kb.load_from_sheets(self.sheets_svc)
+        if self.kb.is_empty():
+            log.warning(
+                "⚠  LISTAS/MATRIZES/CODEBOOK não encontrados na Sheet. "
+                "Usando RAG_CONTEXT_FALLBACK (string estática)."
+            )
+
+        self.geocoder = GeoCoder(
+            cache_path=geocode_cache or default_geocode_cache_path()
+        )
+        self.fewshot_block = carregar_fewshot(self.sheets_svc) if load_fewshot else ""
+
+        self.claude_client = None
+        if not dry_run:
+            api_key = get_anthropic_api_key()
+            if not api_key:
+                raise ValueError(
+                    "Chave da API Anthropic indisponível. Defina ANTHROPIC_API_KEY "
+                    f"ou o segredo '{ANTHROPIC_SECRET_ID}' no AWS Secrets Manager."
+                )
+            self.claude_client = anthropic.Anthropic(
+                api_key=api_key, http_client=httpx.Client(timeout=60.0)
+            )
+
+        # Buffers e cursores da gravação incremental.
+        self.registros_to_write: List[dict] = []
+        self.raw_to_write: List[List[Any]] = []
+        self.reg_flushed = 0
+        self.raw_flushed = 0
+
+    # ── deduplicação dupla (URL canônica + sha256) ─────────────────
+    def is_dup(self, url_canon: str) -> bool:
+        return (url_canon in self.existing_urls
+                or sha256_hex(url_canon) in self.existing_ids)
+
+    # ── gravação incremental (resiliente a timeout) ────────────────
+    def flush(self) -> None:
+        if self.dry_run:
+            return  # dry-run nunca grava na Sheet
+        novos_raw = self.raw_to_write[self.raw_flushed:]
+        if novos_raw:
+            self.sheets_svc = sheets_append_values_com_retry(
+                self.sheets_svc, self.creds, "RAW_TEXT!A1", novos_raw
+            )
+            self.raw_flushed = len(self.raw_to_write)
+            log.info(f"  → RAW_TEXT: +{len(novos_raw)} linha(s) "
+                     f"({self.raw_flushed} no total).")
+        novos_reg = self.registros_to_write[self.reg_flushed:]
+        if novos_reg:
+            append_records_batch(
+                self.sheets_svc, self.headers, self.field_map, novos_reg
+            )
+            self.reg_flushed = len(self.registros_to_write)
+            log.info(f"  → REGISTROS: +{len(novos_reg)} linha(s) "
+                     f"({self.reg_flushed} no total).")
+
+    def maybe_flush(self) -> None:
+        if (not self.dry_run
+                and len(self.registros_to_write) - self.reg_flushed
+                >= SHEET_FLUSH_EVERY):
+            self.flush()
+
+    # ── processamento de UM alerta (scraping→Claude→validação) ─────
+    def processar_alerta(self, alerta: Dict, label: str = "") -> None:
+        url_canon = alerta["url"]
+        id_reg = sha256_hex(url_canon)
         titulo_alerta = alerta.get("title", "")
-        fonte_alerta  = alerta.get("source", "")
-        log.info(f"  [{i}/{len(alertas)}] {titulo_alerta[:80]}")
+        fonte_alerta = alerta.get("source", "")
+        log.info(f"  {label} {titulo_alerta[:80]}")
 
-        # ── a. Scraping ───────────────────────────────────────────
+        # a. Scraping
         fetch = fetch_html(url_canon)
         status_extracao = (
-            "OK"            if fetch.ok else
-            "PAYWALL/ERRO"  if fetch.status_code in (401, 403, 429) else
+            "OK"           if fetch.ok else
+            "PAYWALL/ERRO" if fetch.status_code in (401, 403, 429) else
             "ERRO"
         )
-        html_page        = fetch.html or ""
-        titulo_html      = extract_title_from_html(html_page)
-        published        = extract_published_date_from_html(html_page) or dt.date.today()
+        html_page = fetch.html or ""
+        titulo_html = extract_title_from_html(html_page)
+        # Fallback de data: publicação extraída → dia do digest → hoje. Importante
+        # no backfill para o CODIGO_NOTICIA cair no mês correto.
+        published = (
+            extract_published_date_from_html(html_page)
+            or parse_date_any(alerta.get("date", ""))
+            or dt.date.today()
+        )
         data_noticia_iso = published.isoformat()
-        texto            = extract_main_text(html_page) if fetch.ok else ""
+        texto = extract_main_text(html_page) if fetch.ok else ""
 
-        # ── b. Idioma ─────────────────────────────────────────────
+        # b. Idioma
         idioma = detect_language_pt_es(texto or titulo_alerta)
 
-        # ── c. RAG dinâmico ou fallback ───────────────────────────
-        codigo_base = allocator.next_base(published)
-        if not kb.is_empty():
-            estrategias_candidatas = score_strategies(texto, kb, top_k=4)
-            rag_context = build_rag_context(kb, estrategias_candidatas)
+        # c. RAG dinâmico ou fallback
+        codigo_base = self.allocator.next_base(published)
+        if not self.kb.is_empty():
+            estrategias_candidatas = score_strategies(texto, self.kb, top_k=4)
+            rag_context = build_rag_context(self.kb, estrategias_candidatas)
         else:
             estrategias_candidatas = ["(abas LISTAS/MATRIZES ausentes na Sheet)"]
             rag_context = RAG_CONTEXT_FALLBACK
 
-        # ── RAW_TEXT (auditoria) ──────────────────────────────────
+        # RAW_TEXT (auditoria)
         hash_texto = sha256_hex(texto or "")
-        dominio    = urlparse(url_canon).netloc
-        raw_row    = build_raw_text_row(
-            today_iso=today_iso, url_original=url_canon, url_canon=url_canon,
+        dominio = urlparse(url_canon).netloc
+        raw_row = build_raw_text_row(
+            today_iso=self.today_iso, url_original=url_canon, url_canon=url_canon,
             dominio=dominio, titulo_alerta=titulo_alerta, titulo_html=titulo_html,
             fonte_alerta=fonte_alerta, data_noticia=data_noticia_iso,
             idioma=idioma, status_extracao=status_extracao,
@@ -1920,29 +2075,29 @@ def main(
             codigo_base=codigo_base, hash_texto=hash_texto,
             texto=texto, municipios=[],
         )
-        raw_to_write.append(raw_row)
+        self.raw_to_write.append(raw_row)
 
         fonte_label = (
             f"Notícia (Google Alerts) - {fonte_alerta}"
             if fonte_alerta else "Notícia/imprensa"
         )
 
-        # ── d. Classificação Claude ───────────────────────────────
-        if dry_run:
+        # d. Classificação Claude
+        if self.dry_run:
             result: Dict[str, Any] = {
-                "idioma_detectado":      idioma,
-                "resumo_noticia":        "[DRY-RUN] Stub para testes.",
+                "idioma_detectado": idioma,
+                "resumo_noticia": "[DRY-RUN] Stub para testes.",
                 "municipios_ranqueados": [],
-                "descartar_noticia":     False,
-                "motivo_descarte":       "",
+                "descartar_noticia": False,
+                "motivo_descarte": "",
                 "acoes": [{
-                    "e_autonomica":         True,
-                    "resumo_analitico":     "[DRY-RUN] Vigilância Territorial — stub.",
-                    "pais":                 "Brasil",
+                    "e_autonomica": True,
+                    "resumo_analitico": "[DRY-RUN] Vigilância Territorial — stub.",
+                    "pais": "Brasil",
                     "estrategia_principal": "Vigilância Territorial",
-                    "acao_matriz":          "Monitorar invasões/pressões (patrulhas, registros, alertas)",
-                    "nivel_evidencia":      "3 - Terceiro confiável",
-                    "risco_publicacao":     "Baixo",
+                    "acao_matriz": "Monitorar invasões/pressões (patrulhas, registros, alertas)",
+                    "nivel_evidencia": "3 - Terceiro confiável",
+                    "risco_publicacao": "Baixo",
                     "evidencias": [],
                     "observacoes": "",
                 }],
@@ -1957,84 +2112,77 @@ def main(
                 lang=idioma,
                 estrategias_candidatas=estrategias_candidatas,
                 rag_context=rag_context,
+                fewshot_block=self.fewshot_block,
             )
-            result = _chamar_claude_com_retry(claude_client, SYSTEM_CORE, user_prompt)
-
+            result = _chamar_claude_com_retry(
+                self.claude_client, SYSTEM_CORE, user_prompt
+            )
             if result is None:
                 result = {
-                    "idioma_detectado":      idioma,
-                    "resumo_noticia":        "Erro na classificação automática. Revisão manual necessária.",
+                    "idioma_detectado": idioma,
+                    "resumo_noticia": "Erro na classificação automática. Revisão manual necessária.",
                     "municipios_ranqueados": [],
-                    "descartar_noticia":     True,
-                    "motivo_descarte":       "ERRO_CLAUDE: Falha definitiva na API após retentativas.",
+                    "descartar_noticia": True,
+                    "motivo_descarte": "ERRO_CLAUDE: Falha definitiva na API após retentativas.",
                     "acoes": [],
                 }
 
-        # atualizar municipios na linha RAW_TEXT já enfileirada
         municipios_rank = result.get("municipios_ranqueados") or []
-        if raw_to_write:
-            raw_to_write[-1][-1] = "; ".join(str(m) for m in municipios_rank if m)
+        if self.raw_to_write:
+            self.raw_to_write[-1][-1] = "; ".join(
+                str(m) for m in municipios_rank if m
+            )
 
         descartar = bool(result.get("descartar_noticia"))
-        motivo    = (result.get("motivo_descarte") or "").strip()
-        actions   = result.get("acoes") or []
+        motivo = (result.get("motivo_descarte") or "").strip()
+        actions = result.get("acoes") or []
 
         if descartar or not actions:
             rdict = build_registro(
                 url=url_canon,
                 codigo_noticia=CodigoAllocator.action_code(codigo_base, 1),
-                today_iso=today_iso,
+                today_iso=self.today_iso,
                 title=titulo_alerta or titulo_html,
                 data_noticia_iso=data_noticia_iso,
                 fonte_label=fonte_label,
-                action=None,
-                geo=None,
-                status="Descartado",
-                descarte=True,
+                action=None, geo=None,
+                status="Descartado", descarte=True,
                 motivo_descarte=motivo or (
                     "Sem ação autonômica explícita "
                     "(ruído/ação estatal/insuficiência de evidência)."
                 ),
             )
-            registros_to_write.append(rdict)
-
+            self.registros_to_write.append(rdict)
         else:
-            # ── e. Validação + f. Geocoding + g. Montagem ─────────
             for j, action in enumerate(actions, start=1):
                 notes: List[str] = []
-                if not kb.is_empty():
-                    action = validate_action(action, kb, notes)
+                if not self.kb.is_empty():
+                    action = validate_action(action, self.kb, notes)
                     if notes:
                         obs = action.get("observacoes", "")
                         action["observacoes"] = (
                             (obs + " | " if obs else "") + " | ".join(notes)
                         )
-
                 municipio = (action.get("municipio_provincia") or "").strip()
                 if not municipio and municipios_rank:
                     municipio = str(municipios_rank[0]).strip()
                 geo = None
                 if municipio:
-                    geo = geocoder.geocode_municipio(
-                        municipio,
-                        uf=action.get("uf_depto", ""),
+                    geo = self.geocoder.geocode_municipio(
+                        municipio, uf=action.get("uf_depto", ""),
                         pais=action.get("pais", ""),
                     )
-
                 rdict = build_registro(
                     url=url_canon,
                     codigo_noticia=CodigoAllocator.action_code(codigo_base, j),
-                    today_iso=today_iso,
+                    today_iso=self.today_iso,
                     title=titulo_alerta or titulo_html,
                     data_noticia_iso=data_noticia_iso,
                     fonte_label=fonte_label,
-                    action=action,
-                    geo=geo,
-                    status="Em verificação",
-                    descarte=False,
+                    action=action, geo=geo,
+                    status="Em verificação", descarte=False,
                 )
-                registros_to_write.append(rdict)
-
+                self.registros_to_write.append(rdict)
                 log.info(
                     f"    ✓ Ação {j}: "
                     f"{rdict['ESTRATEGIA_ARVORE_PRIMARIA'] or '—'} | "
@@ -2042,70 +2190,454 @@ def main(
                     f"Risco: {rdict['RISCO_PUBLICACAO']}"
                 )
 
-        existing_urls.add(url_canon)
-        existing_ids.add(id_reg)
+        self.existing_urls.add(url_canon)
+        self.existing_ids.add(id_reg)
 
-        # Gravação incremental: descarrega na Sheet a cada SHEET_FLUSH_EVERY
-        # registros novos, para um timeout não apagar o que já foi processado.
-        if not dry_run and len(registros_to_write) - reg_flushed >= SHEET_FLUSH_EVERY:
-            flush_to_sheets()
 
+def main(
+    dry_run: bool = False,
+    excel_output: Optional[str] = None,
+    limit: Optional[int] = None,
+    geocode_cache: Optional[str] = None,
+) -> None:
+    """Run legado: coleta os alertas das últimas 24h (newer_than:1d) e processa."""
+    log.info("╔══ ObAIAL Pipeline v2 (merged) ════════════════════════")
+    log.info(f"║  Modelo Claude  : {CLAUDE_MODEL}")
+    log.info(f"║  Spreadsheet ID : {SPREADSHEET_ID}")
+    log.info(f"║  Aba principal  : {SHEET_NAME}")
+    log.info(f"║  Dry-run        : {dry_run}")
+    log.info(f"║  Excel local    : {excel_output or '(desativado)'}")
+    log.info("╚═══════════════════════════════════════════════════════")
+
+    ctx = PipelineCtx(dry_run=dry_run, geocode_cache=geocode_cache)
+
+    alertas = coletar_alertas_gmail(ctx.gmail_svc)
+    if limit:
+        alertas = alertas[:limit]
+        log.info(f"Limitado a {limit} item(s) (--limit).")
+
+    for i, alerta in enumerate(alertas, start=1):
+        if ctx.is_dup(alerta["url"]):
+            log.info(f"  [{i}/{len(alertas)}] SKIP (já existente): {alerta['url'][:80]}")
+            continue
+        try:
+            ctx.processar_alerta(alerta, label=f"[{i}/{len(alertas)}]")
+        except Exception as e:  # noqa: BLE001 — um item ruim não aborta o run
+            log.exception(f"Erro ao processar {alerta.get('url','')[:80]}: {e}")
+        ctx.maybe_flush()
         if not dry_run and i < len(alertas):
             time.sleep(INTER_CALL_DELAY)
 
-    # ── 10. Persistir (descarga final do que restou) ──────────────
     if dry_run:
         log.info(
-            f"DRY RUN: {len(raw_to_write)} RAW_TEXT e "
-            f"{len(registros_to_write)} REGISTROS preparados; não gravando."
+            f"DRY RUN: {len(ctx.raw_to_write)} RAW_TEXT e "
+            f"{len(ctx.registros_to_write)} REGISTROS preparados; não gravando."
         )
     else:
-        flush_to_sheets()
+        ctx.flush()
 
-    # ── 11. Excel local opcional ──────────────────────────────────
-    if excel_output and registros_to_write:
-        salvar_excel(registros_to_write, excel_output)
+    if excel_output and ctx.registros_to_write:
+        salvar_excel(ctx.registros_to_write, excel_output)
 
-    # ── 12. Resumo ────────────────────────────────────────────────
-    descartados   = sum(1 for r in registros_to_write if r["STATUS_VALIDACAO"] == "Descartado")
-    classificados = len(registros_to_write) - descartados
-
+    descartados = sum(
+        1 for r in ctx.registros_to_write if r["STATUS_VALIDACAO"] == "Descartado"
+    )
     log.info("\n╔══ RESUMO ═══════════════════════════════════")
     log.info(f"║  Alertas coletados   : {len(alertas)}")
-    log.info(f"║  Registros gerados   : {len(registros_to_write)}")
-    log.info(f"║  Classificados       : {classificados}")
+    log.info(f"║  Registros gerados   : {len(ctx.registros_to_write)}")
+    log.info(f"║  Classificados       : {len(ctx.registros_to_write) - descartados}")
     log.info(f"║  Descartados (ruído) : {descartados}")
     if not dry_run:
-        log.info(f"║  Gravados na Sheet   : {reg_flushed} REGISTROS / {raw_flushed} RAW_TEXT")
+        log.info(f"║  Gravados na Sheet   : {ctx.reg_flushed} REG / {ctx.raw_flushed} RAW")
     log.info("╚════════════════════════════════════════════")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BACKFILL MENSAL EM CHUNKS — MÁQUINA DE ESTADOS (aba ESTADO)
+# ═══════════════════════════════════════════════════════════════════════
+
+ESTADO_KEYS = ["JOB_MES", "CURSOR_DIA", "STATUS", "ATUALIZADO_EM", "ITENS", "GRAVADOS"]
+
+
+def now_ts() -> str:
+    """Timestamp ISO em UTC (data + hora) para o campo ATUALIZADO_EM."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+def estado_load(sheets_svc) -> Dict[str, str]:
+    """Lê a aba ESTADO (key/value). Cria a aba se não existir."""
+    sheets_ensure_tab(sheets_svc, ESTADO_TAB, ["CHAVE", "VALOR"])
+    vals = sheets_get_values(sheets_svc, f"{ESTADO_TAB}!A2:B")
+    return {
+        str(r[0]).strip(): (str(r[1]).strip() if len(r) > 1 else "")
+        for r in vals if r and str(r[0]).strip()
+    }
+
+
+def estado_save(sheets_svc, estado: Dict[str, str]) -> None:
+    """Sobrescreve a aba ESTADO com o conjunto canônico de chaves."""
+    sheets_ensure_tab(sheets_svc, ESTADO_TAB, ["CHAVE", "VALOR"])
+    rows = [["CHAVE", "VALOR"]] + [[k, str(estado.get(k, ""))] for k in ESTADO_KEYS]
+    sheets_svc.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{ESTADO_TAB}!A1",
+        valueInputOption="RAW",
+        body={"values": rows},
+    ).execute()
+
+
+def _mes_anterior(hoje: dt.date) -> str:
+    """Retorna 'YYYY-MM' do mês anterior ao de `hoje`."""
+    ultimo_do_mes_passado = hoje.replace(day=1) - dt.timedelta(days=1)
+    return ultimo_do_mes_passado.strftime("%Y-%m")
+
+
+def backfill_init(sheets_svc, mes: Optional[str] = None) -> Dict[str, str]:
+    """Inicia o job de backfill do mês anterior (ou `mes`='YYYY-MM' explícito)."""
+    mes = (mes or _mes_anterior(dt.date.today())).strip()
+    ano, m = int(mes[:4]), int(mes[5:7])
+    primeiro_dia = dt.date(ano, m, 1)
+    estado = {
+        "JOB_MES":       mes,
+        "CURSOR_DIA":    primeiro_dia.isoformat(),
+        "STATUS":        "EM_ANDAMENTO",
+        "ATUALIZADO_EM": now_ts(),
+        "ITENS":         "0",
+        "GRAVADOS":      "0",
+    }
+    estado_save(sheets_svc, estado)
+    log.info(f"Backfill iniciado: mês {mes}, cursor {primeiro_dia.isoformat()}.")
+    return estado
+
+
+def backfill_chunk(
+    remaining_ms,
+    dry_run: bool = False,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Processa UMA sessão (chunk) do backfill: percorre dias a partir do CURSOR_DIA
+    enquanto houver orçamento de tempo (`remaining_ms()` > CHUNK_RESERVE_MS).
+    - Dia inteiro concluído dentro do tempo → avança o cursor.
+    - Tempo esgotado no meio de um dia → mantém o cursor; a dedup por URL retoma
+      esse dia do ponto em que parou no próximo chunk.
+    Ao passar do fim do mês → STATUS=CONCLUIDO (o digest é enviado pelo handler).
+    """
+    # Checagem leve ANTES de instanciar o pipeline (ticks ociosos saem barato).
+    probe_svc, _ = get_sheets_service()
+    estado = estado_load(probe_svc)
+    if estado.get("STATUS") != "EM_ANDAMENTO":
+        log.info(f"Backfill: nada a fazer (STATUS={estado.get('STATUS') or 'vazio'}).")
+        return {"status": "noop", "estado_status": estado.get("STATUS", "")}
+
+    mes = estado["JOB_MES"]
+    ano, m = int(mes[:4]), int(mes[5:7])
+    fim_mes = dt.date(ano, m, calendar.monthrange(ano, m)[1])
+    cursor = parse_date_any(estado.get("CURSOR_DIA")) or dt.date(ano, m, 1)
+
+    ctx = PipelineCtx(dry_run=dry_run)
+    total_proc = 0
+
+    while cursor <= fim_mes:
+        if remaining_ms() <= CHUNK_RESERVE_MS:
+            log.info(f"Backfill: tempo esgotado antes do dia {cursor} (cursor mantido).")
+            break
+        alertas = coletar_alertas_gmail(
+            ctx.gmail_svc, query=gmail_query_dia(cursor), date_iso=cursor.isoformat()
+        )
+        dia_completo = True
+        for i, alerta in enumerate(alertas, start=1):
+            if limit is not None and total_proc >= limit:
+                dia_completo = False
+                log.info(f"Backfill: --limit {limit} atingido.")
+                break
+            if remaining_ms() <= CHUNK_RESERVE_MS:
+                dia_completo = False
+                log.info(f"Backfill: tempo esgotado no dia {cursor} (item {i}).")
+                break
+            if ctx.is_dup(alerta["url"]):
+                continue
+            try:
+                ctx.processar_alerta(alerta, label=f"[{cursor} {i}/{len(alertas)}]")
+                total_proc += 1
+            except Exception as e:  # noqa: BLE001 — um item ruim não aborta o chunk
+                log.exception(f"Erro ao processar {alerta.get('url','')[:80]}: {e}")
+            ctx.maybe_flush()
+            if not dry_run:
+                time.sleep(INTER_CALL_DELAY)
+        ctx.flush()
+        if not dia_completo:
+            break  # mantém o cursor no mesmo dia
+        cursor = cursor + dt.timedelta(days=1)  # dia concluído → avança
+        if limit is not None and total_proc >= limit:
+            break
+
+    ctx.flush()
+    concluido = cursor > fim_mes
+    estado.update({
+        "CURSOR_DIA":    cursor.isoformat(),
+        "STATUS":        "CONCLUIDO" if concluido else "EM_ANDAMENTO",
+        "ATUALIZADO_EM": now_ts(),
+        "ITENS":         str(int(estado.get("ITENS", "0") or 0) + total_proc),
+        "GRAVADOS":      str(int(estado.get("GRAVADOS", "0") or 0) + ctx.reg_flushed),
+    })
+    if not dry_run:
+        estado_save(ctx.sheets_svc, estado)
+    log.info(
+        f"Backfill chunk: +{total_proc} item(ns) processado(s); "
+        f"cursor={cursor.isoformat()}; status={estado['STATUS']}."
+    )
+    return {
+        "status": estado["STATUS"], "mes": mes,
+        "cursor": estado["CURSOR_DIA"], "processados_no_chunk": total_proc,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DIGEST MENSAL POR E-MAIL (5 positivos + 3 negativos → feedback humano)
+# ═══════════════════════════════════════════════════════════════════════
+
+def carregar_destinatarios(sheets_svc) -> List[str]:
+    """Lê a aba DESTINATARIOS (EMAIL, NOME, ATIVO); ignora linhas com ATIVO=Não."""
+    sheets_ensure_tab(sheets_svc, DESTINATARIOS_TAB, ["EMAIL", "NOME", "ATIVO"])
+    vals = sheets_get_values(sheets_svc, f"{DESTINATARIOS_TAB}!A2:C")
+    out: List[str] = []
+    for r in vals:
+        if not r or not str(r[0]).strip():
+            continue
+        email = str(r[0]).strip()
+        ativo = str(r[2]).strip().lower() if len(r) > 2 else ""
+        if ativo in ("não", "nao", "no", "false", "0"):
+            continue
+        if "@" in email:
+            out.append(email)
+    return out
+
+
+def _sheet_gid(sheets_svc, title: str) -> Optional[int]:
+    """gid (sheetId) de uma aba — para montar deep-link à linha exata."""
+    meta = sheets_svc.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    for s in meta.get("sheets", []):
+        if s["properties"]["title"] == title:
+            return s["properties"].get("sheetId")
+    return None
+
+
+def _deep_link_linha(gid: Optional[int], row: int) -> str:
+    base = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit"
+    return base if gid is None else f"{base}#gid={gid}&range=A{row}"
+
+
+def _codigo_mes(codigo: str) -> str:
+    """Extrai 'YYYY-MM' do CODIGO_NOTICIA (OBAIAL<DDMMAA>...)."""
+    m = re.match(r"^OBAIAL(\d{2})(\d{2})(\d{2})", codigo or "")
+    return f"20{m.group(3)}-{m.group(2)}" if m else ""
+
+
+def selecionar_amostra_digest(
+    sheets_svc, mes: str, excluir_validados: bool = True
+) -> Dict[str, List[dict]]:
+    """
+    Monta o POOL de candidatos do mês para validação humana:
+      - positivos ('Em verificação') ordenados por maior NIVEL_EVIDENCIA;
+      - negativos ('Descartado') embaralhados (amostra aleatória reprodutível).
+    Por padrão exclui itens que já têm VALIDACAO_HUMANA preenchida (não reenviar).
+    Retorna as listas COMPLETAS; o corte por destinatário é feito em enviar_digest.
+    Cada item carrega o número da linha (`row`) para o deep-link de feedback.
+    """
+    regs = sheets_get_values(sheets_svc, f"{SHEET_NAME}!A1:ZZ")
+    if not regs or len(regs) < 2:
+        return {"positivos": [], "negativos": []}
+    headers = regs[0]
+    idx = {h: i for i, h in enumerate(headers)}
+
+    def cell(r: List[Any], name: str) -> str:
+        i = idx.get(name, -1)
+        return str(r[i]).strip() if 0 <= i < len(r) else ""
+
+    positivos, negativos = [], []
+    for n, r in enumerate(regs[1:], start=2):  # n = linha real na Sheet (após header)
+        codigo = cell(r, "CODIGO_NOTICIA")
+        if _codigo_mes(codigo) != mes:
+            continue
+        if excluir_validados and cell(r, "VALIDACAO_HUMANA"):
+            continue  # já tem feedback humano — não reenviar
+        item = {
+            "row":        n,
+            "codigo":     codigo,
+            "titulo":     cell(r, "TITULO_CURTO"),
+            "resumo":     cell(r, "NOTA_ANALITICA")[:DIGEST_RESUMO_LEN],
+            "url":        cell(r, "REFERENCIA_URL"),
+            "estrategia": cell(r, "ESTRATEGIA_ARVORE_PRIMARIA"),
+            "evidencia":  cell(r, "NIVEL_EVIDENCIA"),
+            "status":     cell(r, "STATUS_VALIDACAO"),
+        }
+        if item["status"] == "Descartado":
+            negativos.append(item)
+        elif item["status"] == "Em verificação":
+            positivos.append(item)
+
+    def ev_score(it: dict) -> int:
+        m = re.match(r"\s*(\d+)", it["evidencia"])
+        return int(m.group(1)) if m else 0
+
+    positivos.sort(key=ev_score, reverse=True)
+    rng = random.Random(DIGEST_SEED)
+    rng.shuffle(negativos)
+    return {"positivos": positivos, "negativos": negativos}
+
+
+def render_digest_html(mes: str, amostra: Dict[str, List[dict]], gid: Optional[int]) -> str:
+    """Renderiza o digest em HTML: tabela com resumo, links e ponteiro p/ validar."""
+    def esc(s: Any) -> str:
+        return html_lib.escape(str(s or ""))
+
+    def linha(it: dict, tipo: str) -> str:
+        link_row = _deep_link_linha(gid, it["row"])
+        return (
+            "<tr>"
+            f"<td style='white-space:nowrap'>{esc(tipo)}</td>"
+            f"<td style='white-space:nowrap'>{esc(it['codigo'])}</td>"
+            f"<td><b>{esc(it['titulo'])}</b><br><small>{esc(it['estrategia'] or '—')}</small></td>"
+            f"<td>{esc(it['resumo'])}</td>"
+            f"<td><a href=\"{esc(it['url'])}\">notícia</a></td>"
+            f"<td><a href=\"{esc(link_row)}\">abrir linha p/ validar</a></td>"
+            "</tr>"
+        )
+
+    corpo = "".join(
+        [linha(it, "✅ Positivo") for it in amostra["positivos"]]
+        + [linha(it, "🚫 Negativo") for it in amostra["negativos"]]
+    )
+    return f"""<html><body style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222">
+<h2>ObAIAL — Digest de validação ({esc(mes)})</h2>
+<p>Amostra para revisão humana: <b>{len(amostra['positivos'])} positivos</b>
+(maior nível de evidência) e <b>{len(amostra['negativos'])} negativos</b> (aleatórios).</p>
+<p><b>Como validar:</b> clique em <i>“abrir linha p/ validar”</i>, e na planilha preencha
+as colunas <b>VALIDACAO_HUMANA</b> (Sim/Não) e <b>COMENTARIO_HUMANO</b>. Suas respostas
+calibram automaticamente a classificação do mês seguinte (few-shot).</p>
+<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">
+<thead style="background:#1F4E79;color:#fff">
+<tr><th>Tipo</th><th>Código</th><th>Título / Estratégia</th><th>Resumo</th>
+<th>Link</th><th>Validar</th></tr></thead>
+<tbody>{corpo}</tbody></table>
+<p style="color:#888;font-size:12px">Mensagem automática do pipeline ObAIAL.</p>
+</body></html>"""
+
+
+def enviar_digest(sheets_svc, gmail_svc, mes: str) -> int:
+    """
+    Distribui a validação entre os destinatários: cada pessoa recebe um e-mail
+    com itens DIFERENTES (até DIGEST_N_POSITIVOS positivos + DIGEST_N_NEGATIVOS
+    negativos), via round-robin sobre o pool de não-validados do mês. Assim, com
+    mais gente cadastrada, mais itens são cobertos por rodada (trabalho paralelo).
+    Retorna o total de itens distribuídos (0 = nada enviado).
+    """
+    destinatarios = carregar_destinatarios(sheets_svc)
+    if not destinatarios:
+        log.warning(f"Digest {mes}: aba {DESTINATARIOS_TAB} vazia; não enviado.")
+        return 0
+
+    amostra = selecionar_amostra_digest(sheets_svc, mes)
+    n_dest = len(destinatarios)
+    # Pool dimensionado ao nº de pessoas: cada uma recebe uma cota distinta.
+    pos = amostra["positivos"][: n_dest * DIGEST_N_POSITIVOS]
+    neg = amostra["negativos"][: n_dest * DIGEST_N_NEGATIVOS]
+    if not pos and not neg:
+        log.warning(f"Digest {mes}: nenhum item pendente de validação; não enviado.")
+        return 0
+
+    # Round-robin: espalha itens consecutivos (ex.: ações da mesma notícia) entre
+    # pessoas diferentes, em vez de concentrar numa só.
+    baldes: Dict[str, Dict[str, List[dict]]] = {
+        e: {"positivos": [], "negativos": []} for e in destinatarios
+    }
+    for k, it in enumerate(pos):
+        baldes[destinatarios[k % n_dest]]["positivos"].append(it)
+    for k, it in enumerate(neg):
+        baldes[destinatarios[k % n_dest]]["negativos"].append(it)
+
+    gid = _sheet_gid(sheets_svc, SHEET_NAME)
+    total = 0
+    for email in destinatarios:
+        fatia = baldes[email]
+        qtd = len(fatia["positivos"]) + len(fatia["negativos"])
+        if qtd == 0:
+            continue  # mais gente que itens disponíveis — alguém pode ficar sem
+        html = render_digest_html(mes, fatia, gid)
+        assunto = (
+            f"[ObAIAL] Digest {mes} — {len(fatia['positivos'])} positivos + "
+            f"{len(fatia['negativos'])} negativos para você validar"
+        )
+        enviar_email_gmail(gmail_svc, [email], assunto, html)
+        total += qtd
+    log.info(
+        f"Digest {mes}: {total} item(ns) distribuído(s) entre "
+        f"{n_dest} destinatário(s)."
+    )
+    return total
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # AWS LAMBDA HANDLER
 # ═══════════════════════════════════════════════════════════════════════
 
+def _remaining_ms_from_context(context: Any):
+    """Função que devolve o tempo restante (ms). Usa o contexto do Lambda quando
+    disponível; senão, um orçamento fixo (CLI/local)."""
+    if context is not None and hasattr(context, "get_remaining_time_in_millis"):
+        return context.get_remaining_time_in_millis
+    fim = time.monotonic() + CHUNK_BUDGET_MS / 1000.0
+    return lambda: int((fim - time.monotonic()) * 1000)
+
+
 def lambda_handler(event: Optional[dict] = None, context: Any = None) -> dict:
     """
-    Entrada do AWS Lambda. Agendado via EventBridge para rodar 1x/dia.
+    Entrada do AWS Lambda. Despacha por event["mode"]:
 
-    Eventos aceitos (opcionais, úteis para testes manuais no console):
-        {"dry_run": true}   → não chama Claude nem grava na Sheet
-        {"limit": 5}        → limita o número de alertas processados
+      {"mode": "backfill_init"}                  → inicia o job do mês anterior.
+      {"mode": "backfill_init", "mes": "2026-05"} → idem, para um mês específico.
+      {"mode": "backfill_chunk"}                 → processa um chunk (~até o tempo
+            acabar). Ao concluir o mês, envia o digest por e-mail e marca o estado.
+      (sem mode / "legacy")                      → run das últimas 24h (legado);
+            aceita {"dry_run": true} e {"limit": N}.
 
-    Credenciais vêm exclusivamente do AWS Secrets Manager — nada de segredos
-    em variáveis de ambiente sensíveis nem no código.
+    Credenciais vêm exclusivamente do AWS Secrets Manager.
     """
     event = event or {}
-    dry_run = bool(event.get("dry_run", False))
-    limit = event.get("limit")
+    mode = event.get("mode", "legacy")
     try:
+        if mode == "backfill_init":
+            sheets_svc, _ = get_sheets_service()
+            estado = backfill_init(sheets_svc, mes=event.get("mes"))
+            return {"status": "ok", "mode": mode, "estado": estado}
+
+        if mode == "backfill_chunk":
+            res = backfill_chunk(_remaining_ms_from_context(context))
+            # Se o mês está concluído (agora ou em tick anterior cujo digest falhou),
+            # envia o digest e marca DIGEST_ENVIADO.
+            sheets_svc, _ = get_sheets_service()
+            estado = estado_load(sheets_svc)
+            if estado.get("STATUS") == "CONCLUIDO":
+                gmail_svc = get_gmail_service()
+                n = enviar_digest(sheets_svc, gmail_svc, estado.get("JOB_MES", ""))
+                if n > 0:
+                    estado["STATUS"] = "DIGEST_ENVIADO"
+                    estado["ATUALIZADO_EM"] = now_ts()
+                    estado_save(sheets_svc, estado)
+                res["digest_enviado"] = n
+            return {"status": "ok", "mode": mode, **res}
+
+        # ── modo legado (compatível com testes manuais) ───────────
+        dry_run = bool(event.get("dry_run", False))
+        limit = event.get("limit")
         main(
             dry_run=dry_run,
             excel_output=None,          # Excel local não se aplica ao Lambda
             limit=int(limit) if limit else None,
             geocode_cache=default_geocode_cache_path(),
         )
-        return {"status": "ok", "dry_run": dry_run}
+        return {"status": "ok", "mode": "legacy", "dry_run": dry_run}
     except Exception:
         log.exception("Pipeline ObAIAL falhou.")
         raise  # propaga para o Lambda registrar a falha (CloudWatch / alarme)
@@ -2140,11 +2672,33 @@ if __name__ == "__main__":
         help="Caminho para arquivo de cache de geocoding "
              f"(padrão: {default_geocode_cache_path()})",
     )
+    parser.add_argument(
+        "--backfill-month", "-m", default=None, metavar="YYYY-MM",
+        help="Backfill: inicia o job do mês e roda UM chunk (~8 min) localmente. "
+             "Combine com --limit/--dry-run para teste rápido.",
+    )
+    parser.add_argument(
+        "--send-digest", default=None, metavar="YYYY-MM",
+        help="Envia o digest por e-mail do mês indicado (testa seleção+envio).",
+    )
     args = parser.parse_args()
 
-    main(
-        dry_run=args.dry_run,
-        excel_output=args.excel,
-        limit=args.limit,
-        geocode_cache=args.geocode_cache,
-    )
+    if args.backfill_month:
+        sheets_svc, _ = get_sheets_service()
+        backfill_init(sheets_svc, mes=args.backfill_month)
+        fim = time.monotonic() + CHUNK_BUDGET_MS / 1000.0
+        backfill_chunk(
+            lambda: int((fim - time.monotonic()) * 1000),
+            dry_run=args.dry_run, limit=args.limit,
+        )
+    elif args.send_digest:
+        sheets_svc, _ = get_sheets_service()
+        gmail_svc = get_gmail_service()
+        enviar_digest(sheets_svc, gmail_svc, args.send_digest)
+    else:
+        main(
+            dry_run=args.dry_run,
+            excel_output=args.excel,
+            limit=args.limit,
+            geocode_cache=args.geocode_cache,
+        )

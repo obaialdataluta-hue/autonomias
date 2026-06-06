@@ -98,19 +98,29 @@ corrigir ou aprofundar, com o olhar crítico preservado para o que importa.
 
 ## Sobre este repositório
 
-Pipeline diário do **Observatório das Autonomias Indígenas na América Latina
+Pipeline do **Observatório das Autonomias Indígenas na América Latina
 (ObAIAL)**: coleta Google Alerts via Gmail → scraping do texto completo →
 RAG dinâmico → classificação multi-ação com Claude AI → grava na Google Sheet.
 
-Roda **uma vez por dia** em uma função **AWS Lambda**, agendada por EventBridge.
+Roda em uma função **AWS Lambda** e processa **o mês anterior em chunks**:
+um job é iniciado **1x/mês** (dia 1) e várias **sessões de ~8 min** (a cada
+~12 min) cobrem o mês inteiro, retomando de onde pararam via deduplicação. Ao
+concluir o mês, envia um **digest de validação por e-mail** (Gmail API) com uma
+amostra de positivos e negativos; o **feedback humano** preenchido na planilha
+(`VALIDACAO_HUMANA`/`COMENTARIO_HUMANO`) vira **few-shot** na rodada seguinte.
+
+> **Por que chunks?** Um mês tem ~600 e-mails / milhares de itens, que não cabem
+> nos 900 s (teto do Lambda). Quebrar em sessões curtas e gravar em lotes
+> pequenos (`OBAIAL_FLUSH_EVERY=5`) garante progresso salvo mesmo sob timeout.
 
 ---
 
 ## Como funciona — o fluxo do pipeline
 
-A cada execução diária o pipeline percorre uma esteira de 12 etapas, da caixa de
-entrada do Gmail até a linha gravada na planilha. O desenho abaixo é o mesmo do
-cabeçalho de [`obAIAL_pipeline_merged.py`](src/obAIAL_pipeline_merged.py):
+Em cada sessão (chunk) o pipeline percorre, para cada notícia, uma esteira de
+etapas da caixa de entrada do Gmail até a linha gravada na planilha. O desenho
+abaixo é o mesmo do cabeçalho de
+[`obAIAL_pipeline_merged.py`](src/obAIAL_pipeline_merged.py):
 
 ```text
   Gmail (Google Alerts)
@@ -269,17 +279,25 @@ aws secretsmanager create-secret --region sa-east-1 \
 
 ### Regerar o `token.json` do Gmail
 
+> ⚠️ **Escopo de envio obrigatório.** O digest é enviado pela **Gmail API**, então
+> o token precisa do escopo `gmail.modify` (leitura **e** envio). Um token antigo
+> só-leitura (`gmail.readonly`) **não envia e-mail** — regere com o escopo abaixo.
+
 Localmente, com o `client_secret.json` do projeto:
 
 ```python
 from google_auth_oauthlib.flow import InstalledAppFlow
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
 creds = flow.run_local_server(port=0)
 open("token.json", "w").write(creds.to_json())
 ```
 
-Envie o `token.json` resultante para o Secrets Manager (passo 3 acima).
+Envie o `token.json` resultante para o Secrets Manager (passo 3 acima). O e-mail
+do digest sai da conta Google dona desse token.
+
+> Dica: se o app OAuth estiver em modo **"Testing"**, o `refresh_token` expira em
+> 7 dias. Publique o app (status **"In production"**) para o token não expirar.
 
 ---
 
@@ -294,7 +312,14 @@ cp .env.example .env        # preencha ANTHROPIC_API_KEY
 # são lidos do Secrets Manager.
 
 python src/obAIAL_pipeline_merged.py --dry-run    # teste sem chamar Claude/Sheet
-python src/obAIAL_pipeline_merged.py --limit 3    # execução real, 3 itens
+python src/obAIAL_pipeline_merged.py --limit 3    # run legado (24h), 3 itens
+
+# Backfill mensal (inicia o job + roda UM chunk local):
+python src/obAIAL_pipeline_merged.py --backfill-month 2026-05 --limit 5 --dry-run
+python src/obAIAL_pipeline_merged.py --backfill-month 2026-05 --limit 5
+
+# Testar só o envio do digest de um mês já processado:
+python src/obAIAL_pipeline_merged.py --send-digest 2026-05
 ```
 
 ---
@@ -310,7 +335,7 @@ sam deploy --guided        # primeira vez: salva escolhas em samconfig.toml
 ```
 
 No `--guided`, confirme/ajuste os parâmetros (região dos segredos, IDs,
-`ScheduleExpression`). Deploys seguintes:
+`BackfillInitSchedule`, `BackfillChunkSchedule`). Deploys seguintes:
 
 ```bash
 sam build && sam deploy
@@ -318,17 +343,34 @@ sam build && sam deploy
 
 O `template.yaml` provisiona:
 
-- a função Lambda (`python3.13`, timeout 900 s, 512 MB);
-- o agendamento diário via EventBridge (`cron(0 9 * * ? *)` = 06:00 BRT);
-- política IAM de **privilégio mínimo** — acesso somente aos 3 segredos do projeto;
+- a função Lambda (`python3.13`, timeout 900 s, 1024 MB);
+- **dois** agendamentos EventBridge:
+  - `BackfillInit` — `cron(0 6 1 * ? *)`: inicia o job do mês anterior (dia 1);
+  - `BackfillChunk` — `rate(12 minutes)`: processa o mês em chunks e, ao concluir,
+    envia o digest. Ticks ociosos (sem job ativo) são no-op baratos;
+- política IAM de **privilégio mínimo** — acesso somente aos 3 segredos do projeto
+  (o envio de e-mail usa o token OAuth do Gmail, **sem** IAM adicional);
 - grupo de logs no CloudWatch com retenção de 90 dias.
 
-### Testar a função publicada
+### Pré-requisitos da operação mensal
+
+1. **Token do Gmail com escopo `gmail.modify`** (ver acima) — necessário p/ enviar.
+2. **Aba `DESTINATARIOS`** na planilha (criada automaticamente; preencha as colunas
+   `EMAIL`, `NOME`, `ATIVO`). Quem estiver com `ATIVO=Não` não recebe.
+3. As abas **`ESTADO`** (cursor do backfill) e **`DESTINATARIOS`** são criadas pelo
+   próprio pipeline na primeira execução.
+
+### Testar / rodar manualmente a função publicada
 
 ```bash
+# Rodar o backfill de um mês específico AGORA (ex.: Maio/26):
 aws lambda invoke --function-name obaial-pipeline-diario \
-  --payload '{"dry_run": true}' --cli-binary-format raw-in-base64-out out.json
-cat out.json
+  --payload '{"mode":"backfill_init","mes":"2026-05"}' \
+  --cli-binary-format raw-in-base64-out out.json && cat out.json
+# Em seguida, deixe o schedule de chunk cobrir o mês — ou force um chunk:
+aws lambda invoke --function-name obaial-pipeline-diario \
+  --payload '{"mode":"backfill_chunk"}' \
+  --cli-binary-format raw-in-base64-out out.json && cat out.json
 ```
 
 ---
@@ -336,9 +378,15 @@ cat out.json
 ## Observações operacionais
 
 - **Cache de geocoding:** no Lambda só `/tmp` é gravável; o código usa
-  `/tmp/geocode_cache.json` automaticamente. Esse cache não persiste entre
-  execuções (cada run diária é um *cold start*) — aceitável dado o volume baixo.
-- **Idempotência:** o pipeline deduplica por URL canônica e por hash `sha256`,
-  então reexecuções no mesmo dia não geram linhas duplicadas.
+  `/tmp/geocode_cache.json` automaticamente. Não persiste entre invocações.
+- **Idempotência / retomada:** o pipeline deduplica por URL canônica e por hash
+  `sha256` (lendo `Obial` **e** `RAW_TEXT`). É exatamente esse mecanismo que
+  permite a um chunk **retomar um dia parcialmente processado**: ao reprocessar o
+  mesmo dia, os itens já gravados são pulados. Não há cursor intra-dia.
+- **Estado do backfill:** a aba `ESTADO` guarda `JOB_MES`, `CURSOR_DIA`, `STATUS`
+  (`EM_ANDAMENTO`→`CONCLUIDO`→`DIGEST_ENVIADO`) e contadores. Para reprocessar um
+  mês do zero, basta invocar `backfill_init` para ele de novo.
+- **Digest:** enviado uma vez, quando o mês conclui. Se faltar destinatário em
+  `DESTINATARIOS` ou não houver registros do mês, o envio é pulado (log de aviso).
 - **Falhas:** exceções são propagadas para o Lambda registrar o erro no
   CloudWatch. Configure um alarme em `Errors` da função para ser notificado.
