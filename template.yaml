@@ -64,6 +64,24 @@ Parameters:
     AllowedValues: [TRACE, DEBUG, INFO, WARN, ERROR, FATAL]
     Description: Nível mínimo dos logs da aplicação capturados no CloudWatch.
 
+  # ── Projeto espelho: Estrangeirização (2ª função, perfil próprio) ──
+  EstrangeirizacaoSpreadsheetId:
+    Type: String
+    Default: ""
+    Description: >
+      ID da Google Sheet do projeto Estrangeirização (planilha separada). OBRIGATÓRIO
+      para a 2ª função funcionar; rode src/seed_estrangeirizacao.py para obter o ID.
+
+  EstrangeirizacaoGmailTokenSecretId:
+    Type: String
+    Default: gmail/estrangeirizacao/token
+    Description: Segredo com o token OAuth do Gmail dedicado à Estrangeirização.
+
+  EstrangeirizacaoSheetName:
+    Type: String
+    Default: Estrangeirizacao
+    Description: Nome da aba principal de resultados da Estrangeirização.
+
 # ════════════════════════════════════════════════════════════════════
 Globals:
   Function:
@@ -142,10 +160,80 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${ObAIALPipelineFunction}"
       RetentionInDays: 90
 
+  # ════════════════════════════════════════════════════════════════
+  # 2ª FUNÇÃO — projeto Estrangeirização (mesmo código, perfil próprio)
+  # ════════════════════════════════════════════════════════════════
+  EstrangeirizacaoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: obaial-estrangeirizacao
+      CodeUri: src/
+      Handler: obAIAL_pipeline_merged.lambda_handler
+      Description: Pipeline Estrangeirização (DATALUTA) — perfil estrangeirizacao.
+      Architectures:
+        - x86_64
+      # 1 chunk por vez (evita sobreposição entre gatilhos de 12 min).
+      ReservedConcurrentExecutions: 1
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: !Ref ApplicationLogLevel
+        SystemLogLevel: WARN
+      Environment:
+        Variables:
+          OBAIAL_PROFILE: estrangeirizacao
+          OBAIAL_AWS_REGION: !Ref SecretsRegion
+          GMAIL_TOKEN_SECRET_ID: !Ref EstrangeirizacaoGmailTokenSecretId
+          SHEETS_SA_SECRET_ID: !Ref SheetsSaSecretId          # SA compartilhada
+          ANTHROPIC_SECRET_ID: !Ref AnthropicSecretId          # chave Claude compartilhada
+          OBAIAL_SPREADSHEET_ID: !Ref EstrangeirizacaoSpreadsheetId
+          OBAIAL_SHEET_NAME: !Ref EstrangeirizacaoSheetName
+          ANTHROPIC_MODEL: !Ref AnthropicModel
+          OBAIAL_FLUSH_EVERY: "5"
+      Policies:
+        - Statement:
+            - Sid: ReadProjectSecrets
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${EstrangeirizacaoGmailTokenSecretId}-*"
+                - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${SheetsSaSecretId}-*"
+                - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${AnthropicSecretId}-*"
+            - Sid: RotateGmailToken
+              Effect: Allow
+              Action:
+                - secretsmanager:PutSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${SecretsRegion}:${AWS::AccountId}:secret:${EstrangeirizacaoGmailTokenSecretId}-*"
+      Events:
+        BackfillInit:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref BackfillInitSchedule
+            Name: estrangeirizacao-backfill-init
+            Description: Inicia o backfill Estrangeirização do mês anterior.
+            Input: '{"mode": "backfill_init"}'
+        BackfillChunk:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref BackfillChunkSchedule
+            Name: estrangeirizacao-backfill-chunk
+            Description: Processa um chunk do backfill Estrangeirização.
+            Input: '{"mode": "backfill_chunk"}'
+
+  EstrangeirizacaoLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${EstrangeirizacaoFunction}"
+      RetentionInDays: 90
+
 Outputs:
   FunctionArn:
-    Description: ARN da função Lambda do pipeline.
+    Description: ARN da função Lambda do pipeline (Autonomia).
     Value: !GetAtt ObAIALPipelineFunction.Arn
   FunctionName:
-    Description: Nome da função Lambda.
+    Description: Nome da função Lambda (Autonomia).
     Value: !Ref ObAIALPipelineFunction
+  EstrangeirizacaoFunctionName:
+    Description: Nome da função Lambda (Estrangeirização).
+    Value: !Ref EstrangeirizacaoFunction

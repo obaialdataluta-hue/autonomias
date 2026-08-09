@@ -390,3 +390,53 @@ aws lambda invoke --function-name obaial-pipeline-diario \
   `DESTINATARIOS` ou não houver registros do mês, o envio é pulado (log de aviso).
 - **Falhas:** exceções são propagadas para o Lambda registrar o erro no
   CloudWatch. Configure um alarme em `Errors` da função para ser notificado.
+
+---
+
+## Multi-projeto — perfis (Autonomia + Estrangeirização)
+
+O mesmo código serve a mais de um projeto via **perfis** (`OBAIAL_PROFILE`):
+- **`autonomia`** (default) — Observatório das Autonomias Indígenas (comportamento original).
+- **`estrangeirizacao`** — DATALUTA / Estrangeirização da terra (controle de terra
+  rural por capital estrangeiro).
+
+Cada perfil tem **schema de colunas, RAG/glossário, prompt de classificação e prefixo
+de código** próprios (ver [`src/profiles.py`](src/profiles.py)). O perfil de autonomia
+permanece inline no módulo principal (intocado); o de estrangeirização vive em
+`profiles.py`. Cada projeto roda numa **função Lambda própria** (mesma CodeUri) com sua
+**planilha e conta de e-mail separadas**. A função de autonomia é a `default`; a de
+estrangeirização recebe `OBAIAL_PROFILE=estrangeirizacao` + planilha/token próprios.
+
+### Colocar a Estrangeirização no ar (passo a passo)
+
+1. **Planilha nova:** crie um Google Sheet em branco e compartilhe (Editor) com a
+   service account (`obial-131@obaial.iam.gserviceaccount.com`). Depois semeie as abas,
+   vocabulários (LISTAS) e glossário (CODEBOOK):
+   ```bash
+   python src/seed_estrangeirizacao.py --spreadsheet-id <ID_DA_PLANILHA>
+   ```
+2. **Conta Gmail dedicada:** gere `token.json` com escopo `gmail.modify` (mesmo
+   procedimento acima) e grave no segredo **`gmail/estrangeirizacao/token`**. Cadastre
+   os **Google Alerts** de estrangeirização nessa conta (aquisição/arrendamento de
+   terras, capital estrangeiro, land grabbing, nomes de empresas/fundos, eólica/solar
+   + terra, etc.).
+3. **Deploy:** informe o ID da planilha no parâmetro `EstrangeirizacaoSpreadsheetId`:
+   ```bash
+   sam build && sam deploy \
+     --parameter-overrides EstrangeirizacaoSpreadsheetId=<ID_DA_PLANILHA>
+   ```
+   Isso cria a função `obaial-estrangeirizacao` com seus próprios schedules
+   (init mensal + chunk a cada 12 min).
+4. **Preencher `DESTINATARIOS`** na planilha nova e disparar o 1º mês:
+   ```bash
+   aws lambda invoke --function-name obaial-estrangeirizacao \
+     --payload '{"mode":"backfill_init","mes":"2026-05"}' \
+     --cli-binary-format raw-in-base64-out out.json && cat out.json
+   ```
+
+### Teste local do perfil (sem custo)
+
+```bash
+OBAIAL_PROFILE=estrangeirizacao OBAIAL_SPREADSHEET_ID=<ID> \
+  python src/obAIAL_pipeline_merged.py --backfill-month 2026-05 --limit 3 --dry-run
+```

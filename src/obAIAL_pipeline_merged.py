@@ -249,6 +249,22 @@ DIGEST_SEED        = int(os.getenv("OBAIAL_DIGEST_SEED", "1337"))
 # ── Localização e cache ──────────────────────────────────────────────
 DEFAULT_TZ = os.getenv("OBAIAL_TIMEZONE", "America/Sao_Paulo")
 
+# ── Perfil de projeto (multi-projeto) ────────────────────────────────
+# O mesmo código serve a mais de um projeto. Estes globais têm os VALORES DO
+# PERFIL 'autonomia' por padrão; se OBAIAL_PROFILE selecionar outro perfil, o
+# bloco no FIM do módulo os sobrescreve (depois que todas as funções/literais
+# de domínio já foram definidos). Ver src/profiles.py.
+PROFILE_NAME       = os.getenv("OBAIAL_PROFILE", "autonomia").strip().lower()
+PROJECT_ID         = "autonomia"
+CODE_PREFIX        = "OBAIAL"                        # prefixo do CODIGO_NOTICIA
+CATEGORIA_COL      = "ESTRATEGIA_ARVORE_PRIMARIA"    # coluna no digest/few-shot
+DIGEST_TITLE       = "ObAIAL"                        # título do e-mail
+USER_PROMPT_SCHEMA = None                            # None → schema inline (autonomia)
+RAG_LIST_NAMES: List[str] = []                       # LIST_* do RAG (perfis não-autonomia)
+GEO_FIELDS         = ("municipio_provincia", "uf_depto", "pais")  # campos p/ geocode
+ITEMS_KEY          = "acoes"                         # chave do array de itens no JSON
+VALIDATE_FIELD_MAP: List[Tuple[str, str]] = []       # (campo, LIST_*) p/ perfis genéricos
+
 # ── Excel (saída local opcional) ─────────────────────────────────────
 COR_HEADER      = "1F4E79"
 COR_VERIFICANDO = "DDEBF7"
@@ -1126,6 +1142,24 @@ def build_rag_context(kb: KnowledgeBase, estrategias_candidatas: List[str]) -> s
     ])
 
 
+def build_rag_context_generic(kb: "KnowledgeBase", list_names: List[str]) -> str:
+    """RAG dinâmico simples (sem matrizes): formata as LIST_* do perfil a partir
+    da aba LISTAS. Usado por perfis sem árvore estratégia↔matriz (ex.: estrangeirização)."""
+    listas = kb.listas
+
+    def fmt_list(name: str, limit: int = 200) -> str:
+        vs = listas.get(name, [])
+        if len(vs) > limit:
+            vs = vs[:limit] + ["..."]
+        return f"{name}: {', '.join(vs)}"
+
+    return "\n".join(
+        ["## LISTAS CONTROLADAS (use os valores listados quando couber; senão "
+         "deixe vazio e explique em OBSERVACOES):"]
+        + [fmt_list(n) for n in list_names]
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # SYSTEM PROMPT + USER PROMPT (Fabio — mais robusto que Pipeline 3)
 # ═══════════════════════════════════════════════════════════════════════
@@ -1163,7 +1197,11 @@ def build_user_prompt(
     rag_context: str,
     fewshot_block: str = "",
 ) -> str:
-    schema = """
+    # Perfis não-autonomia fornecem o próprio schema JSON via USER_PROMPT_SCHEMA.
+    if USER_PROMPT_SCHEMA:
+        schema = USER_PROMPT_SCHEMA
+    else:
+        schema = """
 Retorne JSON estrito (sem markdown) com o seguinte formato:
 
 {
@@ -1495,7 +1533,7 @@ class CodigoAllocator:
         ddmmaa  = ddmmaa_from_date(published)
         current = self.max_letter_by_ddmmaa.get(ddmmaa, 0) + 1
         self.max_letter_by_ddmmaa[ddmmaa] = current
-        return f"OBAIAL{ddmmaa}{excel_letters(current)}"
+        return f"{CODE_PREFIX}{ddmmaa}{excel_letters(current)}"
 
     @staticmethod
     def action_code(base: str, n: int) -> str:
@@ -1517,7 +1555,7 @@ def load_existing_codes(sheets_svc) -> Dict[str, int]:
         if idx >= len(r) or not r[idx]:
             continue
         code = str(r[idx]).strip().upper()
-        m = re.match(r"^OBAIAL(\d{6})([A-Z]+)\d+$", code)
+        m = re.match(rf"^{re.escape(CODE_PREFIX)}(\d{{6}})([A-Z]+)\d+$", code)
         if not m:
             continue
         ddmmaa = m.group(1)
@@ -1652,6 +1690,101 @@ def build_raw_text_row(
         codigo_base, hash_texto, truncate_cell(texto),
         "; ".join([m for m in (municipios or []) if m]),
     ]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ESTRANGEIRIZAÇÃO — validação e montagem do registro (perfil DATALUTA)
+# ═══════════════════════════════════════════════════════════════════════
+
+def validate_evento_estrangeirizacao(
+    evento: Dict[str, Any], kb: KnowledgeBase, notes: List[str]
+) -> Dict[str, Any]:
+    """Normaliza/valida um evento de estrangeirização contra as LISTAS fechadas."""
+    listas = kb.listas
+    # normalizar campos multi-valor (separador ';')
+    for mv in ("commodity", "causa_conflito", "tipo_territorio_atingido",
+               "instituicoes_resistencia", "instituicoes_ataque_tipo"):
+        if evento.get(mv):
+            evento[mv] = "; ".join(
+                p.strip() for p in str(evento[mv]).split(";") if p.strip()
+            )
+    # validar apenas as listas realmente fechadas (VALIDATE_FIELD_MAP do perfil)
+    for campo, list_key in VALIDATE_FIELD_MAP:
+        val = evento.get(campo, "")
+        if val:
+            evento[campo] = validate_against_list(
+                val, listas.get(list_key, []), campo.upper(), notes
+            )
+    # hectares → apenas dígitos (ex.: "20.000 ha" → "20000"; "400 mil" fica como veio)
+    h = str(evento.get("hectares", "")).strip()
+    if h and not h.lower() in ("n.i.", "ni", "não informado", "nao informado"):
+        so_digitos = re.sub(r"[^\d]", "", h)
+        evento["hectares"] = so_digitos or h
+    return evento
+
+
+def build_registro_estrangeirizacao(
+    url: str, codigo_noticia: str, today_iso: str, title: str,
+    data_noticia_iso: str, fonte_label: str,
+    action: Optional[Dict[str, Any]], geo: Optional[Tuple[float, float]],
+    status: str, descarte: bool, motivo_descarte: str = "",
+) -> dict:
+    """Monta a linha da aba de resultados de Estrangeirização (chaves == ESTRA_COLUNAS)."""
+    a = action or {}
+    obs_parts = []
+    if motivo_descarte:
+        obs_parts.append(motivo_descarte)
+    if action:
+        evs = [str(e).strip() for e in (a.get("evidencias") or []) if str(e).strip()]
+        if evs:
+            obs_parts.append("EVIDENCIAS: " + " || ".join(evs[:4]))
+        if a.get("observacoes"):
+            obs_parts.append(str(a["observacoes"]).strip())
+    observacoes = " | ".join([p for p in obs_parts if p])
+
+    return {
+        "ID_REGISTRO":              sha256_hex(url),
+        "CODIGO_NOTICIA":           codigo_noticia,
+        "TITULO_CURTO":             title[:140],
+        "DATA_NOTICIA":             data_noticia_iso,
+        "DATA_EVENTO":              a.get("data_evento", "") or data_noticia_iso,
+        "TIPO_EVENTO":              "" if descarte else a.get("tipo_evento", ""),
+        "PAIS":                     a.get("pais", "Brasil") or "Brasil",
+        "MACRORREGIAO":             a.get("macrorregiao", ""),
+        "UF":                       a.get("uf", ""),
+        "MUNICIPIO":                a.get("municipio", ""),
+        "EMPRESA_FUNDO":            a.get("empresa_fundo", ""),
+        "ORIGEM_CAPITAL":           a.get("origem_capital", ""),
+        "TIPO_EMPRESA":             a.get("tipo_empresa", ""),
+        "MODALIDADE":               a.get("modalidade", ""),
+        "HECTARES":                 a.get("hectares", ""),
+        "TIPO_EXTRATIVISMO":        a.get("tipo_extrativismo", ""),
+        "COMMODITY":                a.get("commodity", ""),
+        "TERRITORIALIDADE":         a.get("territorialidade", ""),
+        "CAUSA_CONFLITO":           a.get("causa_conflito", ""),
+        "ESTAGIO_CONFLITO":         a.get("estagio_conflito", ""),
+        "TIPO_TERRITORIO_ATINGIDO": a.get("tipo_territorio_atingido", ""),
+        "COMUNIDADE_TERRITORIO":    a.get("comunidade_territorio", ""),
+        "INSTITUICOES_RESISTENCIA": a.get("instituicoes_resistencia", ""),
+        "INSTITUICOES_ATAQUE_NOME": a.get("instituicoes_ataque_nome", ""),
+        "INSTITUICOES_ATAQUE_TIPO": a.get("instituicoes_ataque_tipo", ""),
+        "TIPO_FONTE":               fonte_label,
+        "REFERENCIA_URL":           url,
+        "NIVEL_EVIDENCIA":          "" if descarte else a.get("nivel_evidencia", ""),
+        "STATUS_VALIDACAO":         status,
+        "GEO_PRECISA":              "Não" if geo else "",
+        "COORD_LAT":                str(geo[0]) if geo else "",
+        "COORD_LON":                str(geo[1]) if geo else "",
+        "NOTA_ANALITICA":           (a.get("resumo_analitico") or (
+            "Descartado automaticamente. " + (motivo_descarte or
+            "Sem indício de estrangeirização (capital estrangeiro / terra rural).")
+        ))[:300],
+        "OBSERVACOES":              observacoes,
+        "CODIFICADOR":              CLAUDE_MODEL,
+        "DATA_VALIDACAO":           "",
+        "VALIDACAO_HUMANA":         "",
+        "COMENTARIO_HUMANO":        "",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1908,7 +2041,7 @@ def carregar_fewshot(sheets_svc) -> str:
         exemplos.append({
             "data":       cell(r, "DATA_VALIDACAO") or cell(r, "DATA_INICIO"),
             "titulo":     cell(r, "TITULO_CURTO"),
-            "estrategia": cell(r, "ESTRATEGIA_ARVORE_PRIMARIA"),
+            "estrategia": cell(r, CATEGORIA_COL),
             "correto":    "Sim" if veredito == "sim" else "Não",
             "comentario": cell(r, "COMENTARIO_HUMANO"),
         })
@@ -2057,8 +2190,8 @@ class PipelineCtx:
         # c. RAG dinâmico ou fallback
         codigo_base = self.allocator.next_base(published)
         if not self.kb.is_empty():
-            estrategias_candidatas = score_strategies(texto, self.kb, top_k=4)
-            rag_context = build_rag_context(self.kb, estrategias_candidatas)
+            estrategias_candidatas = SCORE_FN(texto, self.kb)
+            rag_context = RAG_CONTEXT_FN(self.kb, estrategias_candidatas)
         else:
             estrategias_candidatas = ["(abas LISTAS/MATRIZES ausentes na Sheet)"]
             rag_context = RAG_CONTEXT_FALLBACK
@@ -2084,24 +2217,9 @@ class PipelineCtx:
 
         # d. Classificação Claude
         if self.dry_run:
-            result: Dict[str, Any] = {
-                "idioma_detectado": idioma,
-                "resumo_noticia": "[DRY-RUN] Stub para testes.",
-                "municipios_ranqueados": [],
-                "descartar_noticia": False,
-                "motivo_descarte": "",
-                "acoes": [{
-                    "e_autonomica": True,
-                    "resumo_analitico": "[DRY-RUN] Vigilância Territorial — stub.",
-                    "pais": "Brasil",
-                    "estrategia_principal": "Vigilância Territorial",
-                    "acao_matriz": "Monitorar invasões/pressões (patrulhas, registros, alertas)",
-                    "nivel_evidencia": "3 - Terceiro confiável",
-                    "risco_publicacao": "Baixo",
-                    "evidencias": [],
-                    "observacoes": "",
-                }],
-            }
+            # stub por perfil (cópia profunda para não mutar o global)
+            result: Dict[str, Any] = json.loads(json.dumps(DRY_RUN_STUB))
+            result["idioma_detectado"] = idioma
         else:
             user_prompt = build_user_prompt(
                 title=titulo_alerta or titulo_html,
@@ -2135,10 +2253,10 @@ class PipelineCtx:
 
         descartar = bool(result.get("descartar_noticia"))
         motivo = (result.get("motivo_descarte") or "").strip()
-        actions = result.get("acoes") or []
+        actions = result.get(ITEMS_KEY) or []
 
         if descartar or not actions:
-            rdict = build_registro(
+            rdict = BUILD_REGISTRO(
                 url=url_canon,
                 codigo_noticia=CodigoAllocator.action_code(codigo_base, 1),
                 today_iso=self.today_iso,
@@ -2147,32 +2265,30 @@ class PipelineCtx:
                 fonte_label=fonte_label,
                 action=None, geo=None,
                 status="Descartado", descarte=True,
-                motivo_descarte=motivo or (
-                    "Sem ação autonômica explícita "
-                    "(ruído/ação estatal/insuficiência de evidência)."
-                ),
+                motivo_descarte=motivo or DISCARD_MOTIVO_FALLBACK,
             )
             self.registros_to_write.append(rdict)
         else:
+            mun_key, uf_key, pais_key = GEO_FIELDS
             for j, action in enumerate(actions, start=1):
                 notes: List[str] = []
                 if not self.kb.is_empty():
-                    action = validate_action(action, self.kb, notes)
+                    action = VALIDATE_FN(action, self.kb, notes)
                     if notes:
                         obs = action.get("observacoes", "")
                         action["observacoes"] = (
                             (obs + " | " if obs else "") + " | ".join(notes)
                         )
-                municipio = (action.get("municipio_provincia") or "").strip()
+                municipio = (action.get(mun_key) or "").strip()
                 if not municipio and municipios_rank:
                     municipio = str(municipios_rank[0]).strip()
                 geo = None
                 if municipio:
                     geo = self.geocoder.geocode_municipio(
-                        municipio, uf=action.get("uf_depto", ""),
-                        pais=action.get("pais", ""),
+                        municipio, uf=action.get(uf_key, ""),
+                        pais=action.get(pais_key, ""),
                     )
-                rdict = build_registro(
+                rdict = BUILD_REGISTRO(
                     url=url_canon,
                     codigo_noticia=CodigoAllocator.action_code(codigo_base, j),
                     today_iso=self.today_iso,
@@ -2184,10 +2300,10 @@ class PipelineCtx:
                 )
                 self.registros_to_write.append(rdict)
                 log.info(
-                    f"    ✓ Ação {j}: "
-                    f"{rdict['ESTRATEGIA_ARVORE_PRIMARIA'] or '—'} | "
-                    f"Status: {rdict['STATUS_VALIDACAO']} | "
-                    f"Risco: {rdict['RISCO_PUBLICACAO']}"
+                    f"    ✓ Item {j}: "
+                    f"{rdict.get(CATEGORIA_COL) or '—'} | "
+                    f"Status: {rdict.get('STATUS_VALIDACAO', '')} | "
+                    f"Risco: {rdict.get('RISCO_PUBLICACAO', '—')}"
                 )
 
         self.existing_urls.add(url_canon)
@@ -2429,8 +2545,8 @@ def _deep_link_linha(gid: Optional[int], row: int) -> str:
 
 
 def _codigo_mes(codigo: str) -> str:
-    """Extrai 'YYYY-MM' do CODIGO_NOTICIA (OBAIAL<DDMMAA>...)."""
-    m = re.match(r"^OBAIAL(\d{2})(\d{2})(\d{2})", codigo or "")
+    """Extrai 'YYYY-MM' do CODIGO_NOTICIA (<PREFIXO><DDMMAA>...)."""
+    m = re.match(rf"^{re.escape(CODE_PREFIX)}(\d{{2}})(\d{{2}})(\d{{2}})", codigo or "")
     return f"20{m.group(3)}-{m.group(2)}" if m else ""
 
 
@@ -2468,7 +2584,7 @@ def selecionar_amostra_digest(
             "titulo":     cell(r, "TITULO_CURTO"),
             "resumo":     cell(r, "NOTA_ANALITICA")[:DIGEST_RESUMO_LEN],
             "url":        cell(r, "REFERENCIA_URL"),
-            "estrategia": cell(r, "ESTRATEGIA_ARVORE_PRIMARIA"),
+            "estrategia": cell(r, CATEGORIA_COL),
             "evidencia":  cell(r, "NIVEL_EVIDENCIA"),
             "status":     cell(r, "STATUS_VALIDACAO"),
         }
@@ -2510,7 +2626,7 @@ def render_digest_html(mes: str, amostra: Dict[str, List[dict]], gid: Optional[i
         + [linha(it, "🚫 Negativo") for it in amostra["negativos"]]
     )
     return f"""<html><body style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222">
-<h2>ObAIAL — Digest de validação ({esc(mes)})</h2>
+<h2>{esc(DIGEST_TITLE)} — Digest de validação ({esc(mes)})</h2>
 <p>Amostra para revisão humana: <b>{len(amostra['positivos'])} positivos</b>
 (maior nível de evidência) e <b>{len(amostra['negativos'])} negativos</b> (aleatórios).</p>
 <p><b>Como validar:</b> clique em <i>“abrir linha p/ validar”</i>, e na planilha preencha
@@ -2521,7 +2637,7 @@ calibram automaticamente a classificação do mês seguinte (few-shot).</p>
 <tr><th>Tipo</th><th>Código</th><th>Título / Estratégia</th><th>Resumo</th>
 <th>Link</th><th>Validar</th></tr></thead>
 <tbody>{corpo}</tbody></table>
-<p style="color:#888;font-size:12px">Mensagem automática do pipeline ObAIAL.</p>
+<p style="color:#888;font-size:12px">Mensagem automática do pipeline {esc(DIGEST_TITLE)}.</p>
 </body></html>"""
 
 
@@ -2576,6 +2692,105 @@ def enviar_digest(sheets_svc, gmail_svc, mes: str) -> int:
         f"{n_dest} destinatário(s)."
     )
     return total
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BINDING DO PERFIL DE PROJETO (multi-projeto)
+# ═══════════════════════════════════════════════════════════════════════
+# Ligações de FUNÇÃO por perfil. Ficam aqui porque dependem de funções
+# declaradas acima. Nada executa no import além das ligações — as funções só
+# rodam em runtime. Perfil 'autonomia' = defaults; outro perfil sobrescreve.
+
+def _score_autonomia(text: str, kb: "KnowledgeBase") -> List[str]:
+    return score_strategies(text, kb, top_k=4)
+
+SCORE_FN                = _score_autonomia
+RAG_CONTEXT_FN          = build_rag_context
+VALIDATE_FN             = validate_action
+BUILD_REGISTRO          = build_registro
+DISCARD_MOTIVO_FALLBACK = (
+    "Sem ação autonômica explícita "
+    "(ruído/ação estatal/insuficiência de evidência)."
+)
+DRY_RUN_STUB: Dict[str, Any] = {
+    "idioma_detectado": "pt",
+    "resumo_noticia": "[DRY-RUN] Stub para testes.",
+    "municipios_ranqueados": [],
+    "descartar_noticia": False,
+    "motivo_descarte": "",
+    "acoes": [{
+        "e_autonomica": True,
+        "resumo_analitico": "[DRY-RUN] Vigilância Territorial — stub.",
+        "pais": "Brasil",
+        "estrategia_principal": "Vigilância Territorial",
+        "acao_matriz": "Monitorar invasões/pressões (patrulhas, registros, alertas)",
+        "nivel_evidencia": "3 - Terceiro confiável",
+        "risco_publicacao": "Baixo",
+        "evidencias": [],
+        "observacoes": "",
+    }],
+}
+
+if PROFILE_NAME not in ("autonomia", "autonomias", ""):
+    import profiles as _profiles_mod
+    _P = _profiles_mod.get_profile(PROFILE_NAME)
+    if _P is None:
+        log.warning(f"OBAIAL_PROFILE='{PROFILE_NAME}' desconhecido; usando 'autonomia'.")
+    else:
+        PROJECT_ID            = _P.project_id
+        COLUNAS               = _P.colunas
+        RAW_TEXT_HEADERS      = _P.raw_text_headers
+        SYSTEM_CORE           = _P.system_core
+        RAG_CONTEXT_FALLBACK  = _P.rag_fallback
+        USER_PROMPT_SCHEMA    = _P.user_prompt_schema
+        CODE_PREFIX           = _P.code_prefix
+        CATEGORIA_COL         = _P.categoria_col
+        DIGEST_TITLE          = _P.digest_title
+        RAG_LIST_NAMES        = _P.rag_list_names
+        VALIDATE_FIELD_MAP    = _P.validate_field_map
+        GEO_FIELDS            = _P.geo_fields
+        ITEMS_KEY             = _P.items_key
+        # destino/segredo: usa o env se definido, senão o default do perfil
+        SHEET_NAME            = os.getenv("OBAIAL_SHEET_NAME", _P.sheet_name_default)
+        GMAIL_TOKEN_SECRET_ID = os.getenv("GMAIL_TOKEN_SECRET_ID", _P.gmail_secret_default)
+        SCORE_FN              = lambda text, kb: []
+        RAG_CONTEXT_FN        = lambda kb, _c: build_rag_context_generic(kb, RAG_LIST_NAMES)
+        VALIDATE_FN           = validate_evento_estrangeirizacao
+        BUILD_REGISTRO        = build_registro_estrangeirizacao
+        DISCARD_MOTIVO_FALLBACK = (
+            "Sem indício de estrangeirização (capital estrangeiro / terra rural)."
+        )
+        DRY_RUN_STUB = {
+            "idioma_detectado": "pt",
+            "resumo_noticia": "[DRY-RUN] Stub estrangeirização.",
+            "municipios_ranqueados": [],
+            "descartar_noticia": False,
+            "motivo_descarte": "",
+            "eventos": [{
+                "tipo_evento": "Transação",
+                "resumo_analitico": "[DRY-RUN] Transação estrangeira — stub.",
+                "empresa_fundo": "[DRY] Empresa X",
+                "origem_capital": "China",
+                "tipo_empresa": "Empresa estrangeira",
+                "modalidade": "Aquisição",
+                "hectares": "10000",
+                "tipo_extrativismo": "Agrícola",
+                "commodity": "Soja",
+                "pais": "Brasil", "uf": "MT", "municipio": "Sorriso",
+                "macrorregiao": "Centro-Oeste",
+                "nivel_evidencia": "3 - Terceiro confiável",
+                "evidencias": [], "observacoes": "",
+            }],
+        }
+        if SPREADSHEET_ID == "1Bhhkozi3mduOqwz3VuYjeosLZ3GxrvGV0mAoHyYpwqw":
+            log.warning(
+                "⚠  Perfil 'estrangeirizacao' com SPREADSHEET_ID da AUTONOMIA! "
+                "Defina OBAIAL_SPREADSHEET_ID da planilha nova para não misturar dados."
+            )
+        log.info(
+            f"Perfil de projeto ativo: {PROJECT_ID} "
+            f"(prefixo {CODE_PREFIX}, aba {SHEET_NAME})."
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════
