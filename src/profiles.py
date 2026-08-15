@@ -35,6 +35,7 @@ class Profile:
     categoria_col: str                    # coluna mostrada no digest/few-shot
     digest_title: str                     # título exibido no e-mail de digest
     items_key: str = "acoes"              # chave do array de itens no JSON do Claude
+    rag_glossario: str = ""               # glossário/critérios injetados no RAG dinâmico
     geo_fields: Tuple[str, str, str] = ("municipio_provincia", "uf_depto", "pais")
     listas_seed: Dict[str, List[str]] = field(default_factory=dict)  # p/ semear aba LISTAS
     codebook_seed: Dict[str, str] = field(default_factory=dict)      # glossário (CODEBOOK)
@@ -182,7 +183,33 @@ ESTRA_GLOSSARIO = {
         "estrangeiro). Estrangeirização = controle de terra por capital ESTRANGEIRO "
         "(espécie mais específica)."
     ),
+    "Critérios de INCLUSÃO (o que conta)": (
+        "Registrar quando houver: (a) imóvel RURAL; (b) aquisição, arrendamento ou "
+        "participação societária; (c) por empresa/fundo estrangeiro OU empresa "
+        "brasileira com capital estrangeiro. Também contam CONFLITOS de resistência "
+        "à atuação dessas empresas no campo."
+    ),
+    "Critérios de EXCLUSÃO / ruído (o que NÃO conta)": (
+        "Descartar: terra urbana/industrial; capital 100% nacional sem participação "
+        "estrangeira; fusões/aquisições de empresas sem base fundiária rural; "
+        "notícia genérica de mercado, cotações ou balanço; imóvel não-rural."
+    ),
+    "Modalidades de controle": (
+        "Aquisição direta; arrendamento; participação societária; controle via "
+        "subsidiárias registradas no Brasil; e via FUNDOS de investimento (private "
+        "equity, fundos de pensão, fundos soberanos, hedge funds) — financeirização."
+    ),
+    "Fatores/drivers (contexto)": (
+        "Convergência de crises — alimentar, energética, ambiental/climática e "
+        "financeira (2008) — impulsiona a financeirização e a especulação com terras, "
+        "somadas à nova geopolítica multipolar."
+    ),
 }
+
+# Texto do glossário para injeção direta no RAG dinâmico (prompt de cada notícia).
+ESTRA_RAG_GLOSSARIO = "## GLOSSÁRIO / CRITÉRIOS (DATALUTA):\n" + "\n".join(
+    f"- {termo}: {definicao}" for termo, definicao in ESTRA_GLOSSARIO.items()
+)
 
 ESTRA_SYSTEM_CORE = """
 Você é um Analista de Dados do DATALUTA especializado em ESTRANGEIRIZAÇÃO DA TERRA
@@ -290,6 +317,7 @@ PROFILE_ESTRANGEIRIZACAO = Profile(
     categoria_col="ORIGEM_CAPITAL",
     digest_title="DATALUTA Estrangeirização",
     items_key="eventos",
+    rag_glossario=ESTRA_RAG_GLOSSARIO,
     geo_fields=("municipio", "uf", "pais"),
     listas_seed=ESTRA_LISTAS,
     codebook_seed=ESTRA_GLOSSARIO,

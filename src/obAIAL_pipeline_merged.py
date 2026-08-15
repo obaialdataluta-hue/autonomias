@@ -1142,9 +1142,12 @@ def build_rag_context(kb: KnowledgeBase, estrategias_candidatas: List[str]) -> s
     ])
 
 
-def build_rag_context_generic(kb: "KnowledgeBase", list_names: List[str]) -> str:
-    """RAG dinâmico simples (sem matrizes): formata as LIST_* do perfil a partir
-    da aba LISTAS. Usado por perfis sem árvore estratégia↔matriz (ex.: estrangeirização)."""
+def build_rag_context_generic(
+    kb: "KnowledgeBase", list_names: List[str], glossario: str = ""
+) -> str:
+    """RAG dinâmico simples (sem matrizes): glossário/critérios do domínio +
+    as LIST_* do perfil (aba LISTAS). Usado por perfis sem árvore
+    estratégia↔matriz (ex.: estrangeirização)."""
     listas = kb.listas
 
     def fmt_list(name: str, limit: int = 200) -> str:
@@ -1153,11 +1156,15 @@ def build_rag_context_generic(kb: "KnowledgeBase", list_names: List[str]) -> str
             vs = vs[:limit] + ["..."]
         return f"{name}: {', '.join(vs)}"
 
-    return "\n".join(
-        ["## LISTAS CONTROLADAS (use os valores listados quando couber; senão "
-         "deixe vazio e explique em OBSERVACOES):"]
-        + [fmt_list(n) for n in list_names]
+    partes = []
+    if glossario:
+        partes += [glossario, ""]
+    partes.append(
+        "## LISTAS CONTROLADAS (use os valores listados quando couber; senão "
+        "deixe vazio e explique em OBSERVACOES):"
     )
+    partes += [fmt_list(n) for n in list_names]
+    return "\n".join(partes)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2754,7 +2761,8 @@ if PROFILE_NAME not in ("autonomia", "autonomias", ""):
         SHEET_NAME            = os.getenv("OBAIAL_SHEET_NAME", _P.sheet_name_default)
         GMAIL_TOKEN_SECRET_ID = os.getenv("GMAIL_TOKEN_SECRET_ID", _P.gmail_secret_default)
         SCORE_FN              = lambda text, kb: []
-        RAG_CONTEXT_FN        = lambda kb, _c: build_rag_context_generic(kb, RAG_LIST_NAMES)
+        RAG_CONTEXT_FN        = lambda kb, _c: build_rag_context_generic(
+            kb, RAG_LIST_NAMES, _P.rag_glossario)
         VALIDATE_FN           = validate_evento_estrangeirizacao
         BUILD_REGISTRO        = build_registro_estrangeirizacao
         DISCARD_MOTIVO_FALLBACK = (
